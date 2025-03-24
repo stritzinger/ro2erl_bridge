@@ -1,0 +1,15 @@
+{application, ro2erl_bridge, [
+    {description, "ROS2-Erlang Bridge Component for Target-X"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {ro2erl_bridge_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        rosie_rclerl
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/stritzinger/ro2erl_bridge"}]}
+]}.
