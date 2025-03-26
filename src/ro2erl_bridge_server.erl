@@ -22,6 +22,7 @@ This module is responsible for:
 -export([attach/1, attach/2]).
 -export([detach/1, detach/2]).
 -export([dispatch/1, dispatch/2]).
+-export([is_connected/0, is_connected/1]).
 
 %% Behaviour gen_statem callback functions
 -export([callback_mode/0]).
@@ -119,6 +120,26 @@ ok
 dispatch(ServerRef, Message) ->
     gen_statem:cast(ServerRef, {dispatch, Message}).
 
+-doc """
+Same as calling is_connected(?SERVER).
+""".
+-spec is_connected() -> boolean().
+is_connected() ->
+    is_connected(?SERVER).
+
+-doc """
+Check if the bridge is connected to any hub.
+
+### Example:
+```
+> ro2erl_bridge_server:is_connected(ServerRef).
+true
+```
+""".
+-spec is_connected(ServerRef :: pid() | atom()) -> boolean().
+is_connected(ServerRef) ->
+    gen_statem:call(ServerRef, is_connected).
+
 
 %=== BEHAVIOUR GEN_STATEM CALLBACK FUNCTIONS ==================================
 
@@ -158,12 +179,16 @@ code_change(_Vsn, State, Data, _Extra) ->
 disconnected(cast, {dispatch, _Message}, _Data) ->
     ?LOG_WARNING("Cannot forward message to hub: not connected"),
     keep_state_and_data;
+disconnected({call, From}, is_connected, _Data) ->
+    {keep_state_and_data, [{reply, From, false}]};
 disconnected({call, From}, {detach, _HubPid}, _Data) ->
     % When disconnected, there are no hubs to detach from
     {keep_state_and_data, [{reply, From, {error, not_attached}}]};
 disconnected(EventType, EventContent, Data) ->
     handle_common(EventType, EventContent, ?FUNCTION_NAME, Data).
 
+connected({call, From}, is_connected, _Data) ->
+    {keep_state_and_data, [{reply, From, true}]};
 connected({call, From}, {detach, HubPid}, Data) ->
     case detach_from_hub(HubPid, Data) of
         {error, not_attached} ->
@@ -179,8 +204,8 @@ connected(cast, {dispatch, Message}, Data) ->
     % Forward message to all hubs
     forward_to_all_hubs(Message, Data),
     keep_state_and_data;
-connected(cast, {hub_api_dispatch, Message}, Data) ->
-    dispatch_locally(Message, Data),
+connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
+    dispatch_locally(Timestamp, Message, Data),
     keep_state_and_data;
 connected(EventType, EventContent, Data) ->
     handle_common(EventType, EventContent, ?FUNCTION_NAME, Data).
@@ -204,17 +229,16 @@ handle_common({call, From}, {attach, HubPid}, StateName, Data) ->
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
-handle_common(info, {'DOWN', MonRef, process, _Pid, _Reason}, StateName,
-              Data = #data{hubs = Hubs, hub_mod = HubMod}) ->
+handle_common(info, {'DOWN', MonRef, process, Pid, Reason}, StateName,
+              Data = #data{hubs = Hubs}) ->
     % Check if this is one of our hubs
     case find_hub_by_monitor(MonRef, Hubs) of
-        {ok, HubPid} ->
+        {ok, Pid} ->
             % Remove the hub from our map
-            NewHubs = maps:remove(HubPid, Hubs),
+            NewHubs = maps:remove(Pid, Hubs),
             NewData = Data#data{hubs = NewHubs},
 
-            % Detach from hub
-            HubMod:detach(HubPid, self()),
+            ?LOG_NOTICE("Detached from hub ~p: ~p", [Pid, Reason]),
 
             % Transition to disconnected state if there is no more hubs
             case {StateName, maps:size(NewHubs)} of
@@ -260,9 +284,8 @@ Generate a unique bridge ID by combining node name with timestamp and random byt
 generate_bridge_id() ->
     % Combine node name with random bytes and encode in base64
     NodeBin = atom_to_binary(node(), utf8),
-    Random = crypto:strong_rand_bytes(8),
-    BridgeId = base64:encode(<<NodeBin/binary, Random/binary>>),
-    BridgeId.
+    Random = crypto:strong_rand_bytes(4),
+    <<NodeBin/binary, "/",(base64:encode(Random))/binary>>.
 
 -doc """
 Attach this bridge to a hub.
@@ -290,6 +313,7 @@ attach_to_hub(HubPid, Data = #data{hubs = Hubs, bridge_id = BridgeId, hub_mod = 
             % Use hub module's attach function to register with the hub
             HubMod:attach(HubPid, BridgeId, self()),
 
+            ?LOG_NOTICE("Attached to hub ~p", [HubPid]),
             {ok, NewData}
     end.
 
@@ -317,6 +341,7 @@ detach_from_hub(HubPid, Data = #data{hubs = Hubs, hub_mod = HubMod}) ->
 
             % Update hub map
             NewData = Data#data{hubs = NewHubs},
+            ?LOG_NOTICE("Detached from hub ~p", [HubPid]),
             {ok, NewData}
     end.
 
@@ -332,21 +357,19 @@ forward_to_all_hubs(Message, Data = #data{hubs = Hubs}) ->
 -doc """
 Forward message to hub with metadata.
 """.
-forward_to_hub(HubPid, Message, #data{bridge_id = BridgeId, hub_mod = HubMod}) ->
-    % Wrap message with metadata
-    WrappedMessage = #{
-        bridge_id => BridgeId,
-        timestamp => erlang:system_time(millisecond),
-        payload => Message
-    },
+forward_to_hub(HubPid, Message, #data{hub_mod = HubMod}) ->
+    % Get current timestamp
+    Timestamp = erlang:system_time(millisecond),
 
     % Send to hub using the configured hub module
-    HubMod:dispatch(HubPid, WrappedMessage).
+    HubMod:dispatch(HubPid, self(), Timestamp, Message),
+    ?LOG_DEBUG("Forwarded message to hub ~p: ~p", [HubPid, Message]).
 
 -doc """
 Dispatch received message locally using configured callback.
 """.
-dispatch_locally(Message, #data{local_callback = Callback}) ->
+dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
+    ?LOG_DEBUG("Received message from hub (timestamp: ~p): ~p", [Timestamp, Message]),
     case Callback of
         undefined ->
             % No callback configured

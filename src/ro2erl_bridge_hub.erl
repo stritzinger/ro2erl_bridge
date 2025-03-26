@@ -12,17 +12,17 @@ to communicate with the hub.
 %% API functions
 -export([attach/3]).
 -export([detach/2]).
--export([dispatch/2]).
+-export([dispatch/4]).
 
 
 %=== TYPES =====================================================================
 
 %% Message types for protocol communication
--type attach_msg() :: {attach, binary(), pid()}.
--type detach_msg() :: {detach, pid()}.
--type dispatch_msg() :: {dispatch, term()}.
+-type bridge_attach_msg() :: {bridge_attach, binary(), pid()}.
+-type bridge_detach_msg() :: {bridge_detach, pid()}.
+-type bridge_dispatch_msg() :: {bridge_dispatch, pid(), integer(), term()}.
 
--export_type([attach_msg/0, detach_msg/0, dispatch_msg/0]).
+-export_type([bridge_attach_msg/0, bridge_detach_msg/0, bridge_dispatch_msg/0]).
 
 
 %=== API FUNCTIONS =============================================================
@@ -45,7 +45,7 @@ ok
 """.
 -spec attach(HubPid :: pid(), BridgeId :: binary(), ServicePid :: pid()) -> ok.
 attach(HubPid, BridgeId, ServicePid) when is_pid(HubPid), is_binary(BridgeId), is_pid(ServicePid) ->
-    gen_statem:cast(HubPid, {attach, BridgeId, ServicePid}),
+    gen_statem:cast(HubPid, {bridge_attach, BridgeId, ServicePid}),
     ok.
 
 -doc """
@@ -65,7 +65,7 @@ ok
 """.
 -spec detach(HubPid :: pid(), ServicePid :: pid()) -> ok.
 detach(HubPid, ServicePid) when is_pid(HubPid), is_pid(ServicePid) ->
-    gen_statem:cast(HubPid, {detach, ServicePid}),
+    gen_statem:cast(HubPid, {bridge_detach, ServicePid}),
     ok.
 
 -doc """
@@ -75,15 +75,18 @@ Sends a message to the hub for distribution to other connected services.
 
 ### Parameters:
 - HubPid: pid() - Process ID of the hub service
+- SenderPid: pid() - Process ID of the sender (or undefined for system messages)
+- Timestamp: integer() - When the message was sent (in milliseconds)
 - Message: term() - The message to dispatch
 
 ### Example:
 ```
-> ro2erl_bridge_hub:dispatch(HubPid, {topic, "/sensor", data}).
+> ro2erl_bridge_hub:dispatch(HubPid, self(), erlang:system_time(millisecond), {topic, "/sensor", data}).
 ok
 ```
 """.
--spec dispatch(HubPid :: pid(), Message :: term()) -> ok.
-dispatch(HubPid, Message) when is_pid(HubPid) ->
-    gen_statem:cast(HubPid, {dispatch, Message}),
+-spec dispatch(HubPid :: pid(), SenderPid :: pid() | undefined, Timestamp :: integer(), Message :: term()) -> ok.
+dispatch(HubPid, SenderPid, Timestamp, Message)
+  when is_pid(HubPid), is_integer(Timestamp), (SenderPid =:= undefined orelse is_pid(SenderPid)) ->
+    gen_statem:cast(HubPid, {bridge_dispatch, SenderPid, Timestamp, Message}),
     ok.

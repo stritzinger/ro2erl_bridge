@@ -43,7 +43,6 @@ The bridge is implemented as an Erlang application with the following key compon
 ### Operation Modes
 
 The bridge currently operates in **Dispatch Mode** with the following behavior:
-
 - Receives parsed messages from rosie_rclerl client
 - Applies filtering rules (future capability) 
 - Forwards messages to the hub
@@ -82,6 +81,24 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 3. The bridge can attach to multiple hub processes
 4. If a hub process leaves or crashes, the bridge detaches from that specific hub while maintaining connections to other hubs
 
+## Implementation Details
+
+### State Management
+- Uses `gen_statem` behavior for state transitions
+- Maintains list of connected hubs
+- Handles hub monitoring and reconnection
+
+### Message Processing
+- Expects messages to be in rosie client format
+- Adds timestamps to outgoing messages
+- Forwards messages to all attached hubs without validation
+- Relies on bridges to understand the rosie client message format
+
+### Error Handling
+- Graceful handling of hub disconnections
+- Automatic reconnection attempts
+- Logging of significant state changes
+
 ## Message Flow
 
 ### Outgoing Messages (Local → Remote)
@@ -103,22 +120,17 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 
 ## Configuration
 
-The bridge is designed to be highly configurable with minimal setup:
-
 ### Required Configuration
-
 - **Dispatch Callback:** Function to handle messages from the hub
   - Specified as `{Module, Function}` or `{Module, Function, Args}`
   - Called when messages are received from the hub
 
 ### Future Configuration Options
-
 - Metrics collection settings
 
 ## Integration with ROS2
 
 The bridge integrates with ROS2 through the `rosie_rclerl` library:
-
 - Messages from ROS2 are received via `rosie_rclerl`
 - Bridge forwards these messages to the hub
 - Messages from the hub are dispatched locally via the configured callback
@@ -142,16 +154,12 @@ The bridge relies on the security of the Erlang distribution for communication:
 
 ## Development Status
 
-The bridge is currently in early development with the following implementation status:
-
 ### Implemented Features
-
 - Basic message dispatch and reception
 - Hub discovery and automatic connection
 - Simple API for message forwarding
 
 ### Planned Features
-
 - Message filtering based on rules
 - Network traffic inspection (Network Mode)
 - Advanced metrics collection and reporting
@@ -160,17 +168,11 @@ The bridge is currently in early development with the following implementation s
 ## Deployment Considerations
 
 ### Supported Platforms
-
-The bridge is designed to run on various platforms:
-
 - **Linux Distributions:** Primary platform for standard deployments
 - **RTEMS via grisp board:** For embedded deployment scenarios
 - **Future RTOS support:** Subject to Erlang/OTP compatibility
 
 ### Integration Requirements
-
-To integrate the bridge in an application:
-
 - Add `ro2erl_bridge` as a dependency
 - Configure a dispatch callback
 - Ensure connection to the hub (via grisp.io or custom solution)

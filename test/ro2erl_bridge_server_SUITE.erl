@@ -29,7 +29,7 @@
 -export([
     attach/3,
     detach/2,
-    dispatch/2
+    dispatch/4
 ]).
 
 
@@ -38,7 +38,7 @@
 %% Assertion macros
 -define(assertAttached(HUB_PID, BRIDGE_ID, BRIDGE_PID), fun() ->
     receive
-        {attach, HUB_PID, BRIDGE_ID, BRIDGE_PID} -> ok
+        {bridge_attach, HUB_PID, BRIDGE_ID, BRIDGE_PID} -> ok
     after 1000 ->
         ct:fail({attach_timeout, ?MODULE, ?LINE})
     end
@@ -46,7 +46,7 @@ end()).
 
 -define(assertDetached(HUB_PID, BRIDGE_PID), fun() ->
     receive
-        {detach, HUB_PID, BRIDGE_PID} -> ok
+        {bridge_detach, HUB_PID, BRIDGE_PID} -> ok
     after 1000 ->
         ct:fail({detach_timeout, ?MODULE, ?LINE})
     end
@@ -54,8 +54,8 @@ end()).
 
 -define(assertDispatched(HUB_PID, MESSAGE), fun() ->
     receive
-        {dispatch, HUB_PID, Msg} when Msg == MESSAGE -> ok;
-        {dispatch, HUB_PID, #{payload := MESSAGE}} -> ok
+        {bridge_dispatch, HUB_PID, SenderPid, Timestamp, Msg}
+          when Msg == MESSAGE, is_pid(SenderPid), is_integer(Timestamp) -> ok
     after 1000 ->
         ct:fail({dispatch_timeout, MESSAGE, ?MODULE, ?LINE})
     end
@@ -67,6 +67,14 @@ end()).
     after 300 ->
         ok
     end
+end()).
+
+-define(assertConnected(BRIDGE_PID), fun() ->
+    ?assertEqual(true, ro2erl_bridge_server:is_connected(BRIDGE_PID))
+end()).
+
+-define(assertDisconnected(BRIDGE_PID), fun() ->
+    ?assertEqual(false, ro2erl_bridge_server:is_connected(BRIDGE_PID))
 end()).
 
 
@@ -120,9 +128,14 @@ attach_test(Config) ->
     register(current_test, TestPid),
     BridgePid = proplists:get_value(bridge_pid, Config),
 
+    % Initially disconnected
+    ?assertDisconnected(BridgePid),
+
     % Attach to the hub (which is the test process)
     ok = ro2erl_bridge_server:attach(BridgePid, TestPid),
 
+    % Verify we're connected
+    ?assertConnected(BridgePid),
     ?assertAttached(TestPid, _, BridgePid),
 
     ?assertEqual({error, already_attached}, ro2erl_bridge_server:attach(BridgePid, TestPid)),
@@ -142,14 +155,21 @@ detach_test(Config) ->
     register(current_test, TestPid),
     BridgePid = proplists:get_value(bridge_pid, Config),
 
+    % Initially disconnected
+    ?assertDisconnected(BridgePid),
+
     % Attach to the hub
     ok = ro2erl_bridge_server:attach(BridgePid, TestPid),
 
+    % Verify we're connected
+    ?assertConnected(BridgePid),
     ?assertAttached(TestPid, _, BridgePid),
 
     % Detach
     ok = ro2erl_bridge_server:detach(BridgePid, TestPid),
 
+    % Verify we're disconnected
+    ?assertDisconnected(BridgePid),
     % Assert we got a detach message
     ?assertDetached(TestPid, BridgePid),
 
@@ -169,12 +189,17 @@ hub_crash_test(Config) ->
     register(current_test, TestPid),
     BridgePid = proplists:get_value(bridge_pid, Config),
 
+    % Initially disconnected
+    ?assertDisconnected(BridgePid),
+
     % Create a hub process
     HubProc = spawn(fun() -> hub_proc(TestPid) end),
 
     % Attach the bridge to the hub
     ok = ro2erl_bridge_server:attach(BridgePid, HubProc),
 
+    % Verify we're connected
+    ?assertConnected(BridgePid),
     ?assertAttached(HubProc, _, BridgePid),
 
     % Send a message - should be forwarded to the hub
@@ -189,7 +214,8 @@ hub_crash_test(Config) ->
     % Wait for the monitor to trigger
     timer:sleep(100),
 
-    ?assertDetached(HubProc, BridgePid),
+    % Verify we're disconnected
+    ?assertDisconnected(BridgePid),
 
     % Send another message - should not be forwarded
     TestMessage2 = {test_message, <<"After hub crash">>},
@@ -204,12 +230,17 @@ multiple_hubs_test(Config) ->
     register(current_test, TestPid),
     BridgePid = proplists:get_value(bridge_pid, Config),
 
+    % Initially disconnected
+    ?assertDisconnected(BridgePid),
+
     % Create the first hub process
     Hub1 = spawn(fun() -> hub_proc(TestPid) end),
 
     % Attach to the first hub
     ok = ro2erl_bridge_server:attach(BridgePid, Hub1),
 
+    % Verify we're connected
+    ?assertConnected(BridgePid),
     % Verify attachment to first hub
     ?assertAttached(Hub1, _, BridgePid),
 
@@ -226,6 +257,8 @@ multiple_hubs_test(Config) ->
     % Attach to the second hub
     ok = ro2erl_bridge_server:attach(BridgePid, Hub2),
 
+    % Verify we're still connected
+    ?assertConnected(BridgePid),
     % Verify attachment to second hub
     ?assertAttached(Hub2, _, BridgePid),
 
@@ -243,6 +276,8 @@ multiple_hubs_test(Config) ->
     % Attach to the third hub
     ok = ro2erl_bridge_server:attach(BridgePid, Hub3),
 
+    % Verify we're still connected
+    ?assertConnected(BridgePid),
     % Verify attachment to third hub
     ?assertAttached(Hub3, _, BridgePid),
 
@@ -261,8 +296,10 @@ multiple_hubs_test(Config) ->
     % Wait for the monitor to trigger
     timer:sleep(100),
 
+    % Verify we're still connected (we have other hubs)
+    ?assertConnected(BridgePid),
     % Verify hub1 was detached
-    ?assertDetached(Hub1, BridgePid),
+    % ?assertDetached(Hub1, BridgePid),  % Removed: bridge only receives DOWN message
 
     % Send a message - should be forwarded to the remaining hubs
     TestMessage4 = {test_message, <<"After Hub1 Crash">>},
@@ -275,6 +312,8 @@ multiple_hubs_test(Config) ->
     % Explicitly detach from hub2
     ok = ro2erl_bridge_server:detach(BridgePid, Hub2),
 
+    % Verify we're still connected (we have hub3)
+    ?assertConnected(BridgePid),
     % Verify hub2 was detached
     ?assertDetached(Hub2, BridgePid),
 
@@ -287,12 +326,14 @@ multiple_hubs_test(Config) ->
 
     ?assertNoMessage(),
 
-
     % Clean up - stopping hub3
     Hub3 ! stop,
 
-    % Verify hub3 was detached
-    ?assertDetached(Hub3, BridgePid),
+    % Wait for the monitor to trigger
+    timer:sleep(100),
+
+    % Verify we're disconnected (no more hubs)
+    ?assertDisconnected(BridgePid),
 
     % We should not receive any more message
     ?assertNoMessage(),
@@ -304,15 +345,15 @@ multiple_hubs_test(Config) ->
 %% Test Hub API Implementation - These are called by the bridge
 
 attach(HubPid, BridgeId, BridgePid) ->
-    current_test ! {attach, HubPid, BridgeId, BridgePid},
+    current_test ! {bridge_attach, HubPid, BridgeId, BridgePid},
     ok.
 
 detach(HubPid, BridgePid) ->
-    current_test ! {detach, HubPid, BridgePid},
+    current_test ! {bridge_detach, HubPid, BridgePid},
     ok.
 
-dispatch(HubPid, Message) ->
-    current_test ! {dispatch, HubPid, Message},
+dispatch(HubPid, SenderPid, Timestamp, Message) ->
+    current_test ! {bridge_dispatch, HubPid, SenderPid, Timestamp, Message},
     ok.
 
 
@@ -327,13 +368,13 @@ flush_mailbox() ->
 
 hub_proc(TestPid) ->
     receive
-        {attach, _HubPid, _BridgeId, _BridgePid} = Msg ->
+        {bridge_attach, _HubPid, _BridgeId, _BridgePid} = Msg ->
             TestPid ! Msg,
             hub_proc(TestPid);
-        {detach, _HubPid, _BridgePid} = Msg ->
+        {bridge_detach, _HubPid, _BridgePid} = Msg ->
             TestPid ! Msg,
             hub_proc(TestPid);
-        {dispatch, _HubPid, _Message} = Msg ->
+        {bridge_dispatch, _HubPid, _SenderPid, _Timestamp, _Message} = Msg ->
             TestPid ! Msg,
             hub_proc(TestPid);
         stop ->
