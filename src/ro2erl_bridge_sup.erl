@@ -42,9 +42,21 @@ init([]) ->
         modules => [pg]
     },
 
+    % Get message processor from config or use default
+    MsgProcessor = case application:get_env(ro2erl_bridge, msg_processor) of
+        undefined ->
+            % Default processor that always returns unknown topic
+            fun(_) -> {topic, <<"unknown">>, false, 0} end;
+        {ok, {M, F}} ->
+            fun(Msg) -> M:F(Msg) end;
+        {ok, {M, F, A}} ->
+            fun(Msg) -> erlang:apply(M, F, [Msg | A]) end
+    end,
+
     BridgeServer = #{
         id => ro2erl_bridge_server,
-        start => {ro2erl_bridge_server, start_link, [ro2erl_bridge_hub]},
+        start => {ro2erl_bridge_server, start_link,
+                  [ro2erl_bridge_hub, MsgProcessor]},
         restart => permanent,
         shutdown => 5000,
         type => worker,

@@ -12,7 +12,7 @@ The `ro2erl_bridge` serves as an entry/exit point for ROS2/DDS/RTPS traffic, ope
 
 - Secure message passing between distributed ROS2 networks
 - Automatic hub discovery and connection management
-- Message filtering and traffic shaping (future capability)
+- Message filtering and traffic shaping
 - Metrics collection and reporting
 
 ### Component Structure
@@ -26,6 +26,8 @@ The bridge is implemented as an Erlang application with the following key compon
    - Manages connections to multiple hubs simultaneously
    - Registers with hubs and maintains connection state
    - Processes and forwards messages between local ROS2 network and all attached hubs
+   - Collects metrics per topic and applies bandwidth limiting
+   - Handles filterable vs non-filterable topic behavior
 
 2. **Hub Monitor (`ro2erl_bridge_hub_monitor`):**
    - Monitors hub nodes and processes in the Erlang distribution
@@ -44,8 +46,9 @@ The bridge is implemented as an Erlang application with the following key compon
 
 The bridge currently operates in **Dispatch Mode** with the following behavior:
 - Receives parsed messages from rosie_rclerl client
-- Applies filtering rules (future capability) 
-- Forwards messages to the hub
+- Extracts topic information from messages
+- Processes metrics and applies bandwidth limiting rules
+- Forwards messages to the hub, applying filtering for filterable topics
 - Receives messages from the hub and dispatches them locally via configured callback
 
 Future development will include **Network Mode** for direct network traffic inspection and generation.
@@ -90,14 +93,46 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 
 ### Message Processing
 - Expects messages to be in rosie client format
+- Uses a configurable message processor to extract topic information
+- Classifies topics as filterable or non-filterable
+- Tracks bandwidth usage per topic using a rolling window algorithm
+- Applies bandwidth limits to filterable topics
 - Adds timestamps to outgoing messages
-- Forwards messages to all attached hubs without validation
+- Forwards messages to all attached hubs
 - Relies on bridges to understand the rosie client message format
+
+### Metrics and Filtering
+
+The bridge implements a sophisticated metrics and filtering system:
+
+1. **Topic-Based Metrics:**
+   - Each topic is tracked independently
+   - Metrics are collected for both dispatched and forwarded messages
+   - Bandwidth usage (bytes per second) is calculated using a rolling window
+   - Message rate (messages per second) is tracked for each topic
+
+2. **Bandwidth Limiting:**
+   - Each topic can have an independent bandwidth limit
+   - Limits can be set dynamically at runtime
+   - When a topic exceeds its bandwidth limit, messages are dropped
+   - Limits can be removed by setting to `infinity`
+
+3. **Topic Filtering:**
+   - Topics can be marked as filterable or non-filterable
+   - Filterable topics are subject to bandwidth limits
+   - Non-filterable topics are always forwarded regardless of bandwidth limits
+   - This allows critical messages to bypass congestion control
+
+4. **Metrics API:**
+   - Provides a metrics API to query current bandwidth and message rates
+   - Metrics decay over time using a configurable window (default 5 seconds)
+   - Accurate reporting even with time adjustments or NTP updates
 
 ### Error Handling
 - Graceful handling of hub disconnections
 - Automatic reconnection attempts
 - Logging of significant state changes
+- Detailed logs of message drops due to bandwidth limits
 
 ## Message Flow
 
@@ -105,10 +140,15 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 
 1. Local ROS2 application generates a message
 2. Application calls `ro2erl_bridge:dispatch(Message)`
-3. Bridge server wraps message with metadata (bridge ID, timestamp)
-4. Bridge sends wrapped message to all attached hubs
-5. Each hub distributes message to its connected bridges
-6. Remote bridges dispatch the message to their local networks
+3. Bridge server processes message to extract topic information
+4. Bridge updates dispatch metrics and checks bandwidth limits
+5. For filterable topics: if bandwidth limit is exceeded, message is dropped
+6. For non-filterable topics: message is always forwarded
+7. If forwarded, bridge updates forward metrics
+8. Bridge wraps message with metadata (bridge ID, timestamp)
+9. Bridge sends wrapped message to all attached hubs
+10. Each hub distributes message to its connected bridges
+11. Remote bridges dispatch the message to their local networks
 
 ### Incoming Messages (Remote → Local)
 
@@ -124,9 +164,16 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 - **Dispatch Callback:** Function to handle messages from the hub
   - Specified as `{Module, Function}` or `{Module, Function, Args}`
   - Called when messages are received from the hub
+- **Message Processor:** Function to extract topic information from messages
+  - Specified as `{Module, Function}` or `{Module, Function, Args}`
+  - Must return `{topic, TopicName, Filterable, MsgSize}`
+  - Used to process messages before forwarding to the hub
+  - Determines if topic is filterable and calculates message size
 
-### Future Configuration Options
-- Metrics collection settings
+### Runtime Configuration
+- **Bandwidth Limits:** Can be set per topic at runtime
+  - `set_topic_bandwidth(TopicName, Limit)` where Limit is bytes/second
+  - `set_topic_bandwidth(TopicName, infinity)` removes the limit
 
 ## Integration with ROS2
 
@@ -146,10 +193,15 @@ The bridge relies on the security of the Erlang distribution for communication:
 - Certificate-based authentication through the grisp.io framework
 - The bridge itself does not implement security measures, delegating to the underlying platform
 
+### Security Through Traffic Management
+
+- Bandwidth limiting provides protection against message flooding
+- Topic-based filtering allows for fine-grained control of traffic
+- Non-filterable topics ensure critical messages are always delivered
+
 ### Future Security Enhancements
 
 - Message validation and authentication
-- Rate limiting to prevent DoS attacks
 - Enhanced logging and auditing
 
 ## Development Status
@@ -158,12 +210,15 @@ The bridge relies on the security of the Erlang distribution for communication:
 - Basic message dispatch and reception
 - Hub discovery and automatic connection
 - Simple API for message forwarding
+- Message filtering based on topic properties
+- Bandwidth limiting and traffic shaping
+- Topic-based metrics collection and reporting
+- Support for non-filterable (critical) topics
 
 ### Planned Features
-- Message filtering based on rules
 - Network traffic inspection (Network Mode)
-- Advanced metrics collection and reporting
-- Traffic shaping and prioritization
+- Advanced analytics and visualization
+- Topic-based security policies
 
 ## Deployment Considerations
 
@@ -177,3 +232,4 @@ The bridge relies on the security of the Erlang distribution for communication:
 - Configure a dispatch callback
 - Ensure connection to the hub (via grisp.io or custom solution)
 - Integration with local ROS2 system via `rosie_rclerl`
+- Configure bandwidth limits as appropriate for deployment scenario

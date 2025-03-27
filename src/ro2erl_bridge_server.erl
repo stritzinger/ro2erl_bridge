@@ -18,11 +18,13 @@ This module is responsible for:
 %=== EXPORTS ===================================================================
 
 %% API functions
--export([start_link/1]).
+-export([start_link/2]).
 -export([attach/1, attach/2]).
 -export([detach/1, detach/2]).
 -export([dispatch/1, dispatch/2]).
 -export([is_connected/0, is_connected/1]).
+-export([get_metrics/0, get_metrics/1]).
+-export([set_topic_bandwidth/2, set_topic_bandwidth/3]).
 
 %% Behaviour gen_statem callback functions
 -export([callback_mode/0]).
@@ -33,6 +35,10 @@ This module is responsible for:
 %% State functions
 -export([disconnected/3]).
 -export([connected/3]).
+
+%% Temporary exports until these function are used
+-export([update_dispatch_metrics/2]).
+-export([update_forward_metrics/2]).
 
 
 %=== MACROS ====================================================================
@@ -47,18 +53,31 @@ This module is responsible for:
     % Future fields for filtering rules will go here
 }).
 
+-record(topic, {
+    filterable = false :: boolean(),
+    dispatch_last_update :: undefined | non_neg_integer(),
+    forward_last_update :: undefined | non_neg_integer(),
+    bytes_dispatched = 0 :: non_neg_integer(),
+    msgs_dispatched = 0.0 :: float(),
+    bytes_forwarded = 0 :: non_neg_integer(),
+    msgs_forwarded = 0.0 :: float(),
+    limit = infinity :: non_neg_integer() | infinity
+}).
+
 -record(data, {
     hubs = #{} :: #{pid() => #hub{}},  % Map of hub pids to hub records
     hub_mod :: module(),               % Module to use for hub communication
     local_callback :: undefined | {module(), atom(), list()},
-    bridge_id :: undefined | binary()
+    bridge_id :: undefined | binary(),
+    topics = #{} :: #{Name ::binary() => #topic{}},
+    msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer()})
 }).
 
 
 %=== API FUNCTIONS =============================================================
 
-start_link(HubMod) ->
-    gen_statem:start_link({local, ?SERVER}, ?MODULE, [HubMod], []).
+start_link(HubMod, MsgProcessor) ->
+    gen_statem:start_link({local, ?SERVER}, ?MODULE, [HubMod, MsgProcessor], []).
 
 -doc """
 Same as calling attach(?SERVER, HubPid).
@@ -140,12 +159,79 @@ true
 is_connected(ServerRef) ->
     gen_statem:call(ServerRef, is_connected).
 
+-doc """
+Same as calling get_metrics(?SERVER).
+""".
+-spec get_metrics() -> #{
+    Name :: binary() => #{
+        dispatched := #{bandwidth := non_neg_integer(), rate := float()},
+        forwarded := #{bandwidth := non_neg_integer(), rate := float()}
+    }
+}.
+get_metrics() ->
+    get_metrics(?SERVER).
+
+-doc """
+Get current bandwidth and message rate estimates for all topics.
+Returns both dispatched and forwarded metrics for each topic.
+
+### Example:
+```
+> ro2erl_bridge_server:get_metrics(ServerRef).
+#{
+    <<"topic1">> => #{
+        dispatched => #{bandwidth => 5000, rate => 50.0},
+        forwarded => #{bandwidth => 4000, rate => 40.0}
+    },
+    <<"topic2">> => #{
+        dispatched => #{bandwidth => 3000, rate => 30.0},
+        forwarded => #{bandwidth => 2000, rate => 20.0}
+    }
+}
+```
+""".
+-spec get_metrics(ServerRef :: pid() | atom()) -> #{
+    Name :: binary() => #{
+        dispatched := #{bandwidth := non_neg_integer(), rate := float()},
+        forwarded := #{bandwidth := non_neg_integer(), rate := float()}
+    }
+}.
+get_metrics(ServerRef) ->
+    gen_statem:call(ServerRef, get_metrics).
+
+-doc """
+Same as calling set_topic_bandwidth(?SERVER, TopicName, Bandwidth).
+""".
+-spec set_topic_bandwidth(TopicName :: binary(), Bandwidth :: non_neg_integer() | infinity) -> ok.
+set_topic_bandwidth(TopicName, Bandwidth) ->
+    set_topic_bandwidth(?SERVER, TopicName, Bandwidth).
+
+-doc """
+Set the bandwidth limit for a topic.
+
+The bandwidth limit is specified in bytes per second (byte/s). Setting it to infinity
+removes the limit.
+
+### Example:
+```
+> ro2erl_bridge_server:set_topic_bandwidth(ServerRef, <<"my_topic">>, 1000).
+ok
+> ro2erl_bridge_server:set_topic_bandwidth(ServerRef, <<"my_topic">>, infinity).
+ok
+```
+""".
+-spec set_topic_bandwidth(ServerRef :: pid() | atom(),
+                          TopicName :: binary(),
+                          Bandwidth :: non_neg_integer() | infinity) -> ok.
+set_topic_bandwidth(ServerRef, TopicName, Bandwidth) ->
+    gen_statem:call(ServerRef, {set_topic_bandwidth, TopicName, Bandwidth}).
+
 
 %=== BEHAVIOUR GEN_STATEM CALLBACK FUNCTIONS ==================================
 
 callback_mode() -> [state_functions].
 
-init([HubMod]) ->
+init([HubMod, MsgProcessor]) ->
     % Read configuration
     Config = application:get_all_env(ro2erl_bridge),
 
@@ -164,7 +250,8 @@ init([HubMod]) ->
         hubs = #{},
         hub_mod = HubMod,
         local_callback = Callback,
-        bridge_id = BridgeId
+        bridge_id = BridgeId,
+        msg_processor = MsgProcessor
     }}.
 
 terminate(_Reason, _State, _Data) ->
@@ -200,10 +287,47 @@ connected({call, From}, {detach, HubPid}, Data) ->
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
-connected(cast, {dispatch, Message}, Data) ->
-    % Forward message to all hubs
-    forward_to_all_hubs(Message, Data),
-    keep_state_and_data;
+connected(cast, {dispatch, Message},
+          Data = #data{topics = Topics, msg_processor = MsgProcessor}) ->
+    % Process message to get topic info
+    {topic, TopicName, Filterable, MsgSize} = MsgProcessor(Message),
+
+    % Get or create topic record
+    Topic = case maps:find(TopicName, Topics) of
+        error ->
+            #topic{filterable = Filterable};
+        {ok, ExistingTopic} ->
+            ExistingTopic#topic{filterable = Filterable}
+    end,
+
+    % Update dispatch metrics and check capacity
+    {Capacity, UpdatedTopic} = update_dispatch_metrics(Topic, MsgSize),
+
+    % Update topics map
+    NewTopics = Topics#{TopicName => UpdatedTopic},
+    NewData = Data#data{topics = NewTopics},
+
+    % Check if we can forward the message
+    % Always forward if not filterable, otherwise check capacity
+    ForwardMessage = case {Filterable, Capacity} of
+        {false, _} -> true;
+        {true, infinity} -> true;
+        {true, Remaining} when Remaining >= MsgSize -> true;
+        _ -> false
+    end,
+    case ForwardMessage of
+        true ->
+            % Update forward metrics and forward message
+            FinalTopic = update_forward_metrics(UpdatedTopic, MsgSize),
+            FinalTopics = NewTopics#{TopicName => FinalTopic},
+            FinalData = NewData#data{topics = FinalTopics},
+            forward_to_all_hubs(Message, FinalData),
+            {keep_state, FinalData};
+        false ->
+            ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p, remaining=~p",
+                      [TopicName, MsgSize, Capacity]),
+            {keep_state, NewData}
+    end;
 connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
     dispatch_locally(Timestamp, Message, Data),
     keep_state_and_data;
@@ -229,6 +353,25 @@ handle_common({call, From}, {attach, HubPid}, StateName, Data) ->
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
+handle_common({call, From}, get_metrics, _StateName, Data = #data{topics = Topics}) ->
+    % Get metrics for each topic and build result map
+    {Result, NewTopics} = maps:fold(fun(Name, Topic, {AccMetrics, AccTopics}) ->
+        {Metrics, NewTopic} = get_topic_metrics(Topic),
+        {AccMetrics#{Name => Metrics}, AccTopics#{Name => NewTopic}}
+    end, {#{}, #{}}, Topics),
+    {keep_state, Data#data{topics = NewTopics}, [{reply, From, Result}]};
+handle_common({call, From}, {set_topic_bandwidth, TopicName, Bandwidth}, _StateName,
+              Data = #data{topics = Topics}) ->
+    % Get or create topic record
+    Topic = maps:get(TopicName, Topics, #topic{}),
+
+    % Update topic with new bandwidth limit
+    UpdatedTopic = Topic#topic{limit = Bandwidth},
+    NewTopics = Topics#{TopicName => UpdatedTopic},
+    NewData = Data#data{topics = NewTopics},
+
+    ?LOG_INFO("Set bandwidth limit for topic ~p to ~p", [TopicName, Bandwidth]),
+    {keep_state, NewData, [{reply, From, ok}]};
 handle_common(info, {'DOWN', MonRef, process, Pid, Reason}, StateName,
               Data = #data{hubs = Hubs}) ->
     % Check if this is one of our hubs
@@ -385,3 +528,168 @@ dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
                               [E, R, Stack])
             end
     end.
+
+-doc """
+Calculate the current time and last update timestamps for a topic, handling time discrepancies.
+Returns {Now, DLast, FLast, NewTopic} where:
+- Now is the most recent timestamp we've seen
+- DLast is the last dispatch update time
+- FLast is the last forward update time
+- NewTopic is the updated topic record (reset if time discrepancy is detected)
+""".
+-spec get_topic_timestamps(#topic{}) ->
+    {non_neg_integer(), non_neg_integer(), non_neg_integer(), #topic{}}.
+get_topic_timestamps(Topic = #topic{
+    dispatch_last_update = DLastUpdate0,
+    forward_last_update = FLastUpdate0
+}) ->
+    Current = erlang:system_time(milli_seconds),
+
+    % Determine the most recent timestamp we've seen
+    {MostRecent, DLastUpdate, FLastUpdate} =
+        case {DLastUpdate0, FLastUpdate0} of
+            {undefined, undefined} ->
+                {Current, Current, Current};
+            {undefined, F} ->
+                M = max(Current, F),
+                {M, M, F};
+            {D, undefined} ->
+                M = max(Current, D),
+                {M, D, M};
+            {D, F} ->
+                M = max(Current, max(D, F)),
+                {M, D, F}
+        end,
+
+    % If current time is less than most recent, we had an NTP adjustment
+    case Current < MostRecent of
+        true ->
+            ?LOG_WARNING("Time went backwards: dispatch_last=~p, forward_last=~p, now=~p",
+                         [DLastUpdate, FLastUpdate, Current]),
+            % Reset the topic completely to start fresh
+            ResetTopic = Topic#topic{
+                dispatch_last_update = Current,
+                forward_last_update = Current,
+                bytes_dispatched = 0,
+                msgs_dispatched = 0.0,
+                bytes_forwarded = 0,
+                msgs_forwarded = 0.0
+            },
+            {Current, Current, Current, ResetTopic};
+        false ->
+            {MostRecent, DLastUpdate, FLastUpdate, Topic}
+    end.
+
+-doc """
+Update topic metrics after message dispatch using a rolling window algorithm.
+This function should be called after a message is received from the local network.
+The function returns the remaining capacity for the topic within the current time window.
+For infinite limits, it returns infinity. For finite limits, it calculates how many bytes
+can still be dispatched in the current window before hitting the limit.
+""".
+-spec update_dispatch_metrics(Topic :: #topic{}, MsgSize :: non_neg_integer()) ->
+    {
+        Remaining :: non_neg_integer() | infinity,
+        NewTopic  :: #topic{}
+    }.
+update_dispatch_metrics(Topic, MsgSize) ->
+    #topic{
+        bytes_dispatched = Bytes,
+        msgs_dispatched = Msgs,
+        limit = Limit
+    } = Topic,
+
+    % Get current time and handle NTP time adjustments
+    {Now, Last, _, UpdatedTopic} = get_topic_timestamps(Topic),
+
+    % Update metrics using the metrics module
+    {NewBytes, NewMsgs, _Bandwidth, _MsgRate, Capacity}
+        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, Limit, MsgSize),
+
+    % Update topic record with new values
+    NewTopic = UpdatedTopic#topic{
+        dispatch_last_update = Now,
+        bytes_dispatched = NewBytes,
+        msgs_dispatched = NewMsgs
+    },
+    {Capacity, NewTopic}.
+
+-doc """
+Update topic metrics after message forwarding using a rolling window algorithm.
+This function should be called after a message is forwarded to the hub.
+""".
+-spec update_forward_metrics(Topic :: #topic{}, MsgSize :: non_neg_integer()) ->
+    #topic{}.
+update_forward_metrics(Topic, MsgSize) ->
+    #topic{
+        bytes_forwarded = Bytes,
+        msgs_forwarded = Msgs
+    } = Topic,
+
+    % Get current time and handle NTP time adjustments
+    {Now, _, Last, UpdatedTopic} = get_topic_timestamps(Topic),
+
+    % Update metrics using the metrics module
+    {NewBytes, NewMsgs, _Bandwidth, _MsgRate, _Capacity}
+        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, infinity, MsgSize),
+
+    % Update topic record with new values
+    UpdatedTopic#topic{
+        forward_last_update = Now,
+        bytes_forwarded = NewBytes,
+        msgs_forwarded = NewMsgs
+    }.
+
+-doc """
+Get current bandwidth and message rate estimates for a topic.
+Calculates the current state of the token buckets by applying time-based decay,
+and returns both dispatched and forwarded metrics.
+
+The function does not modify the topic's metrics, it only calculates their current
+state based on the time elapsed since the last update.
+""".
+-spec get_topic_metrics(Topic :: #topic{}) ->
+    {
+        #{
+            dispatched := #{bandwidth := non_neg_integer(), rate := float()},
+            forwarded := #{bandwidth := non_neg_integer(), rate := float()}
+        },
+        #topic{}
+    }.
+get_topic_metrics(Topic) ->
+    #topic{
+        bytes_dispatched = DBytes,
+        msgs_dispatched = DMsgs,
+        bytes_forwarded = FBytes,
+        msgs_forwarded = FMsgs,
+        limit = Limit
+    } = Topic,
+
+    % Get current time and handle NTP time adjustments
+    {Now, DLast, FLast, UpdatedTopic} = get_topic_timestamps(Topic),
+
+    % Calculate current metrics for dispatched data
+    {NewDBytes, NewDMsgs, DBandwidth, DRate, _}
+        = ro2erl_bridge_metrics:update(DLast, Now, DBytes, DMsgs, Limit, undefined),
+
+    % Calculate current metrics for forwarded data
+    {NewFBytes, NewFMsgs, FBandwidth, FRate, _}
+        = ro2erl_bridge_metrics:update(FLast, Now, FBytes, FMsgs, infinity, undefined),
+
+    % Build metrics map
+    Metrics = #{
+        dispatched => #{bandwidth => DBandwidth, rate => DRate},
+        forwarded => #{bandwidth => FBandwidth, rate => FRate}
+    },
+
+    % Update topic with decayed values and current timestamp
+    FinalTopic = UpdatedTopic#topic{
+        dispatch_last_update = Now,
+        forward_last_update = Now,
+        bytes_dispatched = NewDBytes,
+        msgs_dispatched = NewDMsgs,
+        bytes_forwarded = NewFBytes,
+        msgs_forwarded = NewFMsgs
+    },
+
+    {Metrics, FinalTopic}.
