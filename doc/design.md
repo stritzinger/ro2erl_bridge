@@ -75,6 +75,11 @@ A key architectural decision is the separation of connection management from mes
 - For grisp.io framework users, this is handled by the `grisp_connect` library
 - This separation enables different deployment scenarios and connection strategies
 
+### Bridge-Hub API
+
+The communication between Bridge and Hub components follows the protocol defined in the main Target-X design document. For detailed message formats and protocol specifications, refer to:
+[Target-X Design Document](https://github.com/stritzinger/ro2erl_doc/blob/main/design.md)
+
 ### Hub Discovery
 
 The bridge utilizes Erlang's process group (`pg`) module to discover hub processes:
@@ -116,6 +121,7 @@ The bridge implements a sophisticated metrics and filtering system:
    - Limits can be set dynamically at runtime
    - When a topic exceeds its bandwidth limit, messages are dropped
    - Limits can be removed by setting to `infinity`
+   - Limits can be managed locally or remotely by the hub
 
 3. **Topic Filtering:**
    - Topics can be marked as filterable or non-filterable
@@ -127,6 +133,13 @@ The bridge implements a sophisticated metrics and filtering system:
    - Provides a metrics API to query current bandwidth and message rates
    - Metrics decay over time using a configurable window (default 5 seconds)
    - Accurate reporting even with time adjustments or NTP updates
+   - Metrics are periodically reported to the hub for system-wide monitoring
+
+5. **Topic Status Reporting:**
+   - Bridge periodically reports all known topics to connected hubs
+   - Reports include topic metadata, filterable status, bandwidth limits, and metrics
+   - Enables hub to maintain a global view of all topics in the system
+   - Facilitates centralized traffic management and optimization
 
 ### Error Handling
 - Graceful handling of hub disconnections
@@ -158,6 +171,23 @@ The bridge implements a sophisticated metrics and filtering system:
 4. Bridge invokes the configured local dispatch callback
 5. Local callback processes the message or forwards it to ROS2 nodes
 
+### Topic Management Flow
+
+1. Bridge collects topic information:
+   - Tracks metrics for each known topic
+   - Maintains filterable status and bandwidth limits
+   - Updates metrics based on message traffic
+
+2. Bridge periodically reports to hub:
+   - Sends complete topic information to all connected hubs
+   - Includes filterable status, bandwidth limits, and current metrics
+   - Enables hub to maintain a global view of the system
+
+3. Hub controls bandwidth limits:
+   - Hub can set bandwidth limits for specific topics on specific bridges
+   - Bridge applies these limits to control traffic
+   - Enables centralized traffic management across the distributed system
+
 ## Configuration
 
 ### Required Configuration
@@ -170,10 +200,22 @@ The bridge implements a sophisticated metrics and filtering system:
   - Used to process messages before forwarding to the hub
   - Determines if topic is filterable and calculates message size
 
+### Optional Configuration
+- **Topic Update Period:** Interval for sending topic updates to connected hubs
+  - Specified as `topic_update_period` in milliseconds
+  - Default: 1000 (1 second)
+  - Controls how frequently topic metrics and information are sent to hubs
+  - Adjusting this affects both update frequency and hub load
+
 ### Runtime Configuration
 - **Bandwidth Limits:** Can be set per topic at runtime
-  - `set_topic_bandwidth(TopicName, Limit)` where Limit is bytes/second
+  - Locally via `set_topic_bandwidth(TopicName, Limit)` where Limit is bytes/second
+  - Remotely by the hub via `{hub_set_topic_bandwidth, TopicName, Bandwidth}` message
   - `set_topic_bandwidth(TopicName, infinity)` removes the limit
+- **Topic Reporting:** Automatically reports topic information to connected hubs
+  - Configurable reporting interval
+  - Includes all known topics with their metrics and configuration
+  - Enables hub to monitor and manage the entire system
 
 ## Integration with ROS2
 

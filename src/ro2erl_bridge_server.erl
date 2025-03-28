@@ -44,6 +44,7 @@ This module is responsible for:
 %=== MACROS ====================================================================
 
 -define(SERVER, ?MODULE).
+-define(DEFAULT_TOPIC_UPDATE_PERIOD, 1000). % Default 1 second
 
 
 %=== TYPES =====================================================================
@@ -70,7 +71,8 @@ This module is responsible for:
     local_callback :: undefined | {module(), atom(), list()},
     bridge_id :: undefined | binary(),
     topics = #{} :: #{Name ::binary() => #topic{}},
-    msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer()})
+    msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer()}),
+    topic_update_timer :: undefined | reference()   % Timer reference for topic updates
 }).
 
 
@@ -79,9 +81,7 @@ This module is responsible for:
 start_link(HubMod, MsgProcessor) ->
     gen_statem:start_link({local, ?SERVER}, ?MODULE, [HubMod, MsgProcessor], []).
 
--doc """
-Same as calling attach(?SERVER, HubPid).
-""".
+-doc #{equiv => attach/2}.
 -spec attach(pid()) -> ok | {error, already_attached}.
 attach(HubPid) when is_pid(HubPid) ->
     attach(?SERVER, HubPid).
@@ -99,9 +99,7 @@ ok
 attach(ServerRef, HubPid) when is_pid(HubPid) ->
     gen_statem:call(ServerRef, {attach, HubPid}).
 
--doc """
-Same as calling detach(?SERVER, HubPid).
-""".
+-doc #{equiv => detach/2}.
 -spec detach(pid()) -> ok | {error, not_attached}.
 detach(HubPid) when is_pid(HubPid) ->
     detach(?SERVER, HubPid).
@@ -119,9 +117,7 @@ ok
 detach(ServerRef, HubPid) when is_pid(HubPid) ->
     gen_statem:call(ServerRef, {detach, HubPid}).
 
--doc """
-Same as calling dispatch(?SERVER, Message).
-""".
+-doc #{equiv => dispatch/2}.
 -spec dispatch(term()) -> ok.
 dispatch(Message) ->
     dispatch(?SERVER, Message).
@@ -139,9 +135,7 @@ ok
 dispatch(ServerRef, Message) ->
     gen_statem:cast(ServerRef, {dispatch, Message}).
 
--doc """
-Same as calling is_connected(?SERVER).
-""".
+-doc #{equiv => is_connected/1}.
 -spec is_connected() -> boolean().
 is_connected() ->
     is_connected(?SERVER).
@@ -159,9 +153,7 @@ true
 is_connected(ServerRef) ->
     gen_statem:call(ServerRef, is_connected).
 
--doc """
-Same as calling get_metrics(?SERVER).
-""".
+-doc #{equiv => get_metrics/1}.
 -spec get_metrics() -> #{
     Name :: binary() => #{
         dispatched := #{bandwidth := non_neg_integer(), rate := float()},
@@ -199,9 +191,7 @@ Returns both dispatched and forwarded metrics for each topic.
 get_metrics(ServerRef) ->
     gen_statem:call(ServerRef, get_metrics).
 
--doc """
-Same as calling set_topic_bandwidth(?SERVER, TopicName, Bandwidth).
-""".
+-doc #{equiv => set_topic_bandwidth/3}.
 -spec set_topic_bandwidth(TopicName :: binary(), Bandwidth :: non_neg_integer() | infinity) -> ok.
 set_topic_bandwidth(TopicName, Bandwidth) ->
     set_topic_bandwidth(?SERVER, TopicName, Bandwidth).
@@ -245,7 +235,7 @@ init([HubMod, MsgProcessor]) ->
     % Generate a unique bridge ID
     BridgeId = generate_bridge_id(),
 
-    % Initialize state
+    % Initialize state (no timer yet, will be scheduled when connected)
     {ok, disconnected, #data{
         hubs = #{},
         hub_mod = HubMod,
@@ -254,7 +244,9 @@ init([HubMod, MsgProcessor]) ->
         msg_processor = MsgProcessor
     }}.
 
-terminate(_Reason, _State, _Data) ->
+terminate(_Reason, _State, Data) ->
+    % Cancel the timer when terminating
+    cancel_hub_update(Data),
     ok.
 
 code_change(_Vsn, State, Data, _Extra) ->
@@ -271,6 +263,11 @@ disconnected({call, From}, is_connected, _Data) ->
 disconnected({call, From}, {detach, _HubPid}, _Data) ->
     % When disconnected, there are no hubs to detach from
     {keep_state_and_data, [{reply, From, {error, not_attached}}]};
+disconnected(info, topic_update, Data) ->
+    % Ignore topic_update messages when disconnected
+    % (This should not happen unless we just transitioned from connected)
+    ?LOG_DEBUG("Ignoring topic_update message while disconnected"),
+    {keep_state, Data};
 disconnected(EventType, EventContent, Data) ->
     handle_common(EventType, EventContent, ?FUNCTION_NAME, Data).
 
@@ -283,7 +280,10 @@ connected({call, From}, {detach, HubPid}, Data) ->
         {ok, NewData} ->
             % If no more hubs, transition to disconnected state
             case maps:size(NewData#data.hubs) of
-                0 -> {next_state, disconnected, NewData, [{reply, From, ok}]};
+                0 ->
+                    % Cancel the timer since we're transitioning to disconnected
+                    FinalData = cancel_hub_update(NewData),
+                    {next_state, disconnected, FinalData, [{reply, From, ok}]};
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
@@ -329,8 +329,30 @@ connected(cast, {dispatch, Message},
             {keep_state, NewData}
     end;
 connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
+    % Handle message from hub by dispatching it to the local callback
     dispatch_locally(Timestamp, Message, Data),
     keep_state_and_data;
+connected(info, topic_update,
+          Data = #data{hubs = Hubs, hub_mod = HubMod, topics = Topics}) ->
+    % Get fresh metrics for all topics
+    {AllMetrics, UpdatedTopics} = maps:fold(fun(Name, Topic, {AccMetrics, AccTopics}) ->
+        {Metrics, NewTopic} = get_topic_metrics(Topic),
+        {AccMetrics#{Name => #{
+            filterable => Topic#topic.filterable,
+            bandwidth_limit => Topic#topic.limit,
+            metrics => Metrics
+        }}, AccTopics#{Name => NewTopic}}
+    end, {#{}, #{}}, Topics),
+
+    % Send update to all connected hubs
+    maps:foreach(fun(HubPid, _) ->
+        HubMod:update_topics(HubPid, self(), AllMetrics)
+    end, Hubs),
+
+    % Update topics with refreshed metrics and reschedule the next update
+    UpdatedData = Data#data{topics = UpdatedTopics},
+    RescheduledData = schedule_hub_update(UpdatedData),
+    {keep_state, RescheduledData};
 connected(EventType, EventContent, Data) ->
     handle_common(EventType, EventContent, ?FUNCTION_NAME, Data).
 
@@ -339,7 +361,6 @@ connected(EventType, EventContent, Data) ->
 
 -doc """
 Handle events common to all states
-
 Processes events that are handled the same way regardless of current state.
 """.
 handle_common({call, From}, {attach, HubPid}, StateName, Data) ->
@@ -349,7 +370,10 @@ handle_common({call, From}, {attach, HubPid}, StateName, Data) ->
         {ok, NewData} ->
             % Transition to connected state if we're currently disconnected
             case {StateName, maps:size(Data#data.hubs)} of
-                {disconnected, 0} -> {next_state, connected, NewData, [{reply, From, ok}]};
+                {disconnected, 0} ->
+                    % Schedule the first topic update when transitioning to connected
+                    ConnectedData = schedule_hub_update(NewData),
+                    {next_state, connected, ConnectedData, [{reply, From, ok}]};
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
@@ -360,18 +384,14 @@ handle_common({call, From}, get_metrics, _StateName, Data = #data{topics = Topic
         {AccMetrics#{Name => Metrics}, AccTopics#{Name => NewTopic}}
     end, {#{}, #{}}, Topics),
     {keep_state, Data#data{topics = NewTopics}, [{reply, From, Result}]};
-handle_common({call, From}, {set_topic_bandwidth, TopicName, Bandwidth}, _StateName,
-              Data = #data{topics = Topics}) ->
-    % Get or create topic record
-    Topic = maps:get(TopicName, Topics, #topic{}),
-
-    % Update topic with new bandwidth limit
-    UpdatedTopic = Topic#topic{limit = Bandwidth},
-    NewTopics = Topics#{TopicName => UpdatedTopic},
-    NewData = Data#data{topics = NewTopics},
-
+handle_common({call, From}, {set_topic_bandwidth, TopicName, Bandwidth}, _StateName, Data) ->
+    NewData = update_topic_bandwidth(TopicName, Bandwidth, Data),
     ?LOG_INFO("Set bandwidth limit for topic ~p to ~p", [TopicName, Bandwidth]),
     {keep_state, NewData, [{reply, From, ok}]};
+handle_common(cast, {hub_set_topic_bandwidth, TopicName, Bandwidth}, _StateName, Data) ->
+    NewData = update_topic_bandwidth(TopicName, Bandwidth, Data),
+    ?LOG_INFO("Hub set bandwidth limit for topic ~p to ~p", [TopicName, Bandwidth]),
+    {keep_state, NewData};
 handle_common(info, {'DOWN', MonRef, process, Pid, Reason}, StateName,
               Data = #data{hubs = Hubs}) ->
     % Check if this is one of our hubs
@@ -385,7 +405,9 @@ handle_common(info, {'DOWN', MonRef, process, Pid, Reason}, StateName,
 
             % Transition to disconnected state if there is no more hubs
             case {StateName, maps:size(NewHubs)} of
-                {connected, 0} -> {next_state, disconnected, NewData};
+                {connected, 0} ->
+                    % Cancel the timer since we're disconnected
+                    {next_state, disconnected, cancel_hub_update(NewData)};
                 _ -> {keep_state, NewData}
             end;
         _ ->
@@ -434,10 +456,6 @@ generate_bridge_id() ->
 Attach this bridge to a hub.
 
 Sets up monitoring, updates the hub map, and communicates with the hub.
-
-### Returns:
-- {ok, NewData} - Attachment successful, returns updated state
-- {error, already_attached} - Hub is already attached
 """.
 -spec attach_to_hub(HubPid :: pid(), Data :: #data{}) ->
     {ok, #data{}} | {error, already_attached}.
@@ -464,10 +482,6 @@ attach_to_hub(HubPid, Data = #data{hubs = Hubs, bridge_id = BridgeId, hub_mod = 
 Detach this bridge from a hub.
 
 Cleans up monitoring, updates the hub map, and communicates with the hub.
-
-### Returns:
-- {ok, NewData} - Detachment successful, returns updated state
-- {error, not_attached} - Hub is not attached
 """.
 -spec detach_from_hub(HubPid :: pid(), Data :: #data{}) ->
     {ok, #data{}} | {error, not_attached}.
@@ -521,7 +535,7 @@ dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
         {M, F, A} ->
             % Call configured callback with message and additional args
             try
-                erlang:apply(M, F, [Message | A])
+                erlang:apply(M, F, A ++ [Message])
             catch
                 E:R:Stack ->
                     ?LOG_ERROR("Error dispatching message locally: ~p:~p~n~p",
@@ -531,6 +545,7 @@ dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
 
 -doc """
 Calculate the current time and last update timestamps for a topic, handling time discrepancies.
+
 Returns {Now, DLast, FLast, NewTopic} where:
 - Now is the most recent timestamp we've seen
 - DLast is the last dispatch update time
@@ -582,6 +597,7 @@ get_topic_timestamps(Topic = #topic{
 
 -doc """
 Update topic metrics after message dispatch using a rolling window algorithm.
+
 This function should be called after a message is received from the local network.
 The function returns the remaining capacity for the topic within the current time window.
 For infinite limits, it returns infinity. For finite limits, it calculates how many bytes
@@ -616,6 +632,7 @@ update_dispatch_metrics(Topic, MsgSize) ->
 
 -doc """
 Update topic metrics after message forwarding using a rolling window algorithm.
+
 This function should be called after a message is forwarded to the hub.
 """.
 -spec update_forward_metrics(Topic :: #topic{}, MsgSize :: non_neg_integer()) ->
@@ -642,6 +659,7 @@ update_forward_metrics(Topic, MsgSize) ->
 
 -doc """
 Get current bandwidth and message rate estimates for a topic.
+
 Calculates the current state of the token buckets by applying time-based decay,
 and returns both dispatched and forwarded metrics.
 
@@ -693,3 +711,51 @@ get_topic_metrics(Topic) ->
     },
 
     {Metrics, FinalTopic}.
+
+-doc """
+Updates the bandwidth limit for a topic.
+""".
+-spec update_topic_bandwidth(
+    TopicName :: binary(),
+    Bandwidth :: non_neg_integer() | infinity,
+    Data :: #data{}
+) -> #data{}.
+update_topic_bandwidth(TopicName, Bandwidth, Data = #data{topics = Topics}) ->
+    % Get or create topic record
+    Topic = maps:get(TopicName, Topics, #topic{}),
+
+    % Update topic with new bandwidth limit
+    UpdatedTopic = Topic#topic{limit = Bandwidth},
+    NewTopics = Topics#{TopicName => UpdatedTopic},
+    Data#data{topics = NewTopics}.
+
+-doc """
+Gets the topic update period from application environment or uses the default.
+""".
+get_update_period() ->
+    application:get_env(ro2erl_bridge, topic_update_period,
+                        ?DEFAULT_TOPIC_UPDATE_PERIOD).
+
+-doc """
+Schedules the next topic update message.
+Cancels any existing timer first to avoid leaking timers.
+""".
+schedule_hub_update(Data) ->
+    % Cancel any existing timer first
+    Data2 = cancel_hub_update(Data),
+
+    % Schedule the next update
+    UpdatePeriod = get_update_period(),
+    NewTimer = erlang:send_after(UpdatePeriod, self(), topic_update),
+
+    % Return updated data with new timer
+    Data2#data{topic_update_timer = NewTimer}.
+
+-doc """
+Cancels the topic update timer if it exists.
+""".
+cancel_hub_update(Data = #data{topic_update_timer = undefined}) ->
+    Data;
+cancel_hub_update(Data = #data{topic_update_timer = Timer}) ->
+    erlang:cancel_timer(Timer),
+    Data#data{topic_update_timer = undefined}.
