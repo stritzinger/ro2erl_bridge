@@ -47,16 +47,27 @@ init([]) ->
         undefined ->
             % Default processor that always returns unknown topic
             fun(_) -> {topic, <<"unknown">>, false, 0} end;
-        {ok, {M, F}} ->
-            fun(Msg) -> M:F(Msg) end;
-        {ok, {M, F, A}} ->
-            fun(Msg) -> erlang:apply(M, F, [Msg | A]) end
+        {ok, {ProcM, ProcF}} ->
+            fun(Msg) -> ProcM:ProcF(Msg) end;
+        {ok, {ProcM, ProcF, ProcA}} ->
+            fun(Msg) -> erlang:apply(ProcM, ProcF, ProcA ++ [Msg]) end
+    end,
+
+    % Get dispatch callback from config
+    DispatchCallback = case application:get_env(ro2erl_bridge, dispatch_callback) of
+        undefined ->
+            % No callback configured
+            undefined;
+        {ok, {CallbackM, CallbackF}} ->
+            fun(Message) -> CallbackM:CallbackF(Message) end;
+        {ok, {CallbackM, CallbackF, CallbackA}} ->
+            fun(Message) -> erlang:apply(CallbackM, CallbackF, CallbackA ++ [Message]) end
     end,
 
     BridgeServer = #{
         id => ro2erl_bridge_server,
         start => {ro2erl_bridge_server, start_link,
-                  [ro2erl_bridge_hub, MsgProcessor]},
+                  [ro2erl_bridge_hub, MsgProcessor, DispatchCallback]},
         restart => permanent,
         shutdown => 5000,
         type => worker,

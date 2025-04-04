@@ -7,9 +7,6 @@
         kernel,
         stdlib
     ]},
-    {include_applications, [
-        rosie_rclerl
-    ]},
     {env, []},
     {modules, []},
     {licenses, ["Apache-2.0"]},

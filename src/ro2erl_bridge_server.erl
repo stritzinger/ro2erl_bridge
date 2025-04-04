@@ -18,7 +18,7 @@ This module is responsible for:
 %=== EXPORTS ===================================================================
 
 %% API functions
--export([start_link/2]).
+-export([start_link/2, start_link/3]).
 -export([attach/1, attach/2]).
 -export([detach/1, detach/2]).
 -export([dispatch/1, dispatch/2]).
@@ -68,7 +68,7 @@ This module is responsible for:
 -record(data, {
     hubs = #{} :: #{pid() => #hub{}},  % Map of hub pids to hub records
     hub_mod :: module(),               % Module to use for hub communication
-    local_callback :: undefined | {module(), atom(), list()},
+    local_callback :: undefined | fun((term()) -> ok),
     bridge_id :: undefined | binary(),
     topics = #{} :: #{Name ::binary() => #topic{}},
     msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer()}),
@@ -79,7 +79,10 @@ This module is responsible for:
 %=== API FUNCTIONS =============================================================
 
 start_link(HubMod, MsgProcessor) ->
-    gen_statem:start_link({local, ?SERVER}, ?MODULE, [HubMod, MsgProcessor], []).
+    start_link(HubMod, MsgProcessor, undefined).
+
+start_link(HubMod, MsgProcessor, DispatchCallback) ->
+    gen_statem:start_link({local, ?SERVER}, ?MODULE, [HubMod, MsgProcessor, DispatchCallback], []).
 
 -doc #{equiv => attach/2}.
 -spec attach(pid()) -> ok | {error, already_attached}.
@@ -221,17 +224,7 @@ set_topic_bandwidth(ServerRef, TopicName, Bandwidth) ->
 
 callback_mode() -> [state_functions].
 
-init([HubMod, MsgProcessor]) ->
-    % Read configuration
-    Config = application:get_all_env(ro2erl_bridge),
-
-    % Extract callback configuration (or use default)
-    Callback = case proplists:get_value(dispatch_callback, Config) of
-        {M, F} -> {M, F, []};
-        {M, F, A} -> {M, F, A};
-        undefined -> undefined
-    end,
-
+init([HubMod, MsgProcessor, DispatchCallback]) ->
     % Generate a unique bridge ID
     BridgeId = generate_bridge_id(),
 
@@ -239,7 +232,7 @@ init([HubMod, MsgProcessor]) ->
     {ok, disconnected, #data{
         hubs = #{},
         hub_mod = HubMod,
-        local_callback = Callback,
+        local_callback = DispatchCallback,
         bridge_id = BridgeId,
         msg_processor = MsgProcessor
     }}.
@@ -528,14 +521,10 @@ Dispatch received message locally using configured callback.
 dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
     ?LOG_DEBUG("Received message from hub (timestamp: ~p): ~p", [Timestamp, Message]),
     case Callback of
-        undefined ->
-            % No callback configured
-            ?LOG_WARNING("No dispatch callback configured, message dropped"),
-            ok;
-        {M, F, A} ->
-            % Call configured callback with message and additional args
+        undefined -> ok;
+        CallbackFun when is_function(CallbackFun, 1) ->
             try
-                erlang:apply(M, F, A ++ [Message])
+                CallbackFun(Message)
             catch
                 E:R:Stack ->
                     ?LOG_ERROR("Error dispatching message locally: ~p:~p~n~p",

@@ -18,6 +18,7 @@ the caller to provide timestamps instead of using system time.
 
 %% Rate limiting configuration
 -define(METRIC_WINDOW, 5000).  % 5 second window for rate calculations
+-define(RATE_THRESHOLD, 0.01).
 
 
 %=== API FUNCTIONS =============================================================
@@ -84,7 +85,10 @@ update(LastUpdate, Now, Bytes, MsgCount, Limit, MsgSize) ->
 
     % Calculate current rates per-second
     Bandwidth = round(NewBytes * 1000 / ?METRIC_WINDOW),
-    MsgRate = NewMsgCount * 1000.0 / ?METRIC_WINDOW,
+    MsgRate = case NewMsgCount * 1000.0 / ?METRIC_WINDOW of
+        R when R >= ?RATE_THRESHOLD -> R;
+        _ -> 0.0
+    end,
 
     % Calculate remaining capacity based on limit
     Capacity = case Limit of

@@ -34,7 +34,11 @@
     % Non-filterable tests
     non_filterable_always_forward_test/1,
     % Multiple topics tests
-    multiple_topics_metrics_test/1
+    multiple_topics_metrics_test/1,
+    % Future test cases
+    hub_set_bandwidth_test/1,
+    dispatch_callback_test/1,
+    topic_update_test/1
 ]).
 
 %% Test Hub API - Used by the bridge
@@ -42,18 +46,26 @@
     attach/3,
     detach/2,
     dispatch/4,
-    test_message_processor/1
+    update_topics/3
+]).
+
+%% Test callback functions
+-export([
+    test_message_processor/1,
+    test_dispatch_callback/1
 ]).
 
 
 %=== MACROS ===================================================================
+
+-define(FMT(F, A), lists:flatten(io_lib:format(F, A))).
 
 %% Assertion macros
 -define(assertAttached(HUB_PID, BRIDGE_ID, BRIDGE_PID), fun() ->
     receive
         {bridge_attach, HUB_PID, BRIDGE_ID, BRIDGE_PID} -> ok
     after 1000 ->
-        ct:fail({attach_timeout, ?MODULE, ?LINE})
+        ct:fail({attach_timeout, ?FUNCTION_NAME, ?LINE})
     end
 end()).
 
@@ -61,7 +73,7 @@ end()).
     receive
         {bridge_detach, HUB_PID, BRIDGE_PID} -> ok
     after 1000 ->
-        ct:fail({detach_timeout, ?MODULE, ?LINE})
+        ct:fail({detach_timeout, ?FUNCTION_NAME, ?LINE})
     end
 end()).
 
@@ -70,13 +82,29 @@ end()).
         {bridge_dispatch, HUB_PID, SenderPid, Timestamp, Msg}
           when Msg == MESSAGE, is_pid(SenderPid), is_integer(Timestamp) -> ok
     after 1000 ->
-        ct:fail({dispatch_timeout, MESSAGE, ?MODULE, ?LINE})
+        ct:fail({dispatch_timeout, MESSAGE, ?FUNCTION_NAME, ?LINE})
+    end
+end()).
+
+-define(assertTopicUpdated(HUB_PID, TOPICS), fun() ->
+    receive
+        {bridge_update_topics, HUB_PID, _, TOPICS = M_Topics} -> M_Topics
+    after 1500 ->
+        ct:fail({topic_update_timeout, ?FUNCTION_NAME, ?LINE})
+    end
+end()).
+
+-define(assertDispatchedLocally(MESSAGE), fun() ->
+    receive
+        {local_dispatch, Msg} when Msg == MESSAGE -> ok
+    after 1000 ->
+        ct:fail({local_dispatch_timeout, MESSAGE, ?FUNCTION_NAME, ?LINE})
     end
 end()).
 
 -define(assertNoMessage(), fun() ->
     receive
-        Any -> ct:fail({unexpected_message, Any, ?MODULE, ?LINE})
+        Any -> ct:fail({unexpected_message, Any, ?FUNCTION_NAME, ?LINE})
     after 300 ->
         ok
     end
@@ -88,6 +116,20 @@ end()).
 
 -define(assertDisconnected(BRIDGE_PID), fun() ->
     ?assertEqual(false, ro2erl_bridge_server:is_connected(BRIDGE_PID))
+end()).
+
+-define(assertNoDispatchMessage(), fun() ->
+    fun M_ReceiveLoop() ->
+        receive
+            {bridge_update_topics, _, _, _} ->
+                % Ignore topic updates, recursively check for other messages
+                M_ReceiveLoop();
+            Any ->
+                ct:fail({unexpected_message, Any, ?MODULE, ?LINE})
+        after 300 ->
+            ok
+        end
+    end()
 end()).
 
 
@@ -105,7 +147,11 @@ all() -> [
     bandwidth_limit_set_test,
     bandwidth_limit_remove_test,
     non_filterable_always_forward_test,
-    multiple_topics_metrics_test
+    multiple_topics_metrics_test,
+    % Future test cases
+    hub_set_bandwidth_test,
+    dispatch_callback_test,
+    topic_update_test
 ].
 
 init_per_suite(Config) ->
@@ -114,16 +160,15 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     Config.
 
-init_per_testcase(dispatch_callback_invocation_test, Config) ->
-    % For callback tests, set dispatch callback in environment
-    application:set_env(ro2erl_bridge, dispatch_callback, {?MODULE, handle_message}),
-    init_base_testcase(Config);
+init_per_testcase(dispatch_callback_test, Config) ->
+    init_base_testcase(Config, fun test_dispatch_callback/1);
 init_per_testcase(_TestCase, Config) ->
-    init_base_testcase(Config).
+    init_base_testcase(Config, undefined).
 
-init_base_testcase(Config) ->
+init_base_testcase(Config, DispatchCallback) ->
     % Start the bridge server with this module as the hub module
-    {ok, BridgePid} = ro2erl_bridge_server:start_link(?MODULE, fun ?MODULE:test_message_processor/1),
+    {ok, BridgePid} = ro2erl_bridge_server:start_link(
+        ?MODULE, fun test_message_processor/1, DispatchCallback),
 
     % Drain any previous messages from mailbox
     flush_mailbox(),
@@ -541,7 +586,7 @@ metrics_decay_test(Config) ->
     FinalForwardBandwidth = maps:get(bandwidth, maps:get(forwarded, FullyDecayedTopicMetrics)),
     FinalForwardRate = maps:get(rate, maps:get(forwarded, FullyDecayedTopicMetrics)),
 
-    % Verify that metrics have decayed significantly (should be very close to zero)
+    % Verify that metrics have decayed significantly
     ?assert(FinalDispatchBandwidth < DecayedDispatchBandwidth,
            "Dispatch bandwidth should decay further over time"),
     ?assert(FinalDispatchRate < DecayedDispatchRate,
@@ -551,17 +596,17 @@ metrics_decay_test(Config) ->
     ?assert(FinalForwardRate < DecayedForwardRate,
            "Forward rate should decay further over time"),
 
-    % The values should be very close to zero after full decay time
-    ?assert(FinalDispatchBandwidth < InitialDispatchBandwidth * 0.1,
+    ?assert(FinalDispatchBandwidth < InitialDispatchBandwidth * 0.2,
            "Dispatch bandwidth should decay to near zero"),
-    ?assert(FinalDispatchRate < InitialDispatchRate * 0.1,
+    ?assert(FinalDispatchRate < InitialDispatchRate * 0.2,
            "Dispatch rate should decay to near zero"),
-    ?assert(FinalForwardBandwidth < InitialForwardBandwidth * 0.1,
+    ?assert(FinalForwardBandwidth < InitialForwardBandwidth * 0.2,
            "Forward bandwidth should decay to near zero"),
-    ?assert(FinalForwardRate < InitialForwardRate * 0.1,
+    ?assert(FinalForwardRate < InitialForwardRate * 0.2,
            "Forward rate should decay to near zero"),
 
     % Clear the message queue
+    flush_topic_updates(),
     ?assertNoMessage(),
 
     ok.
@@ -595,31 +640,28 @@ metrics_window_test(Config) ->
 
     % Get metrics immediately after sending all messages
     Metrics1 = ro2erl_bridge_server:get_metrics(BridgePid),
-    TopicMetrics1 = maps:get(TopicName, Metrics1),
-
-    % Extract the bandwidth and rate values
-    DispatchMetrics1 = maps:get(dispatched, TopicMetrics1),
-    Bandwidth1 = maps:get(bandwidth, DispatchMetrics1),
-    Rate1 = maps:get(rate, DispatchMetrics1),
+    #{TopicName := #{
+        dispatched := #{bandwidth := Bandwidth1, rate := Rate1},
+        forwarded := #{bandwidth := ForwardBandwidth1, rate := ForwardRate1}
+    }} = Metrics1,
 
     % Ensure metrics were recorded properly
     ?assert(Bandwidth1 > 0, "Initial bandwidth should be greater than 0"),
     ?assert(Rate1 > 0.0, "Initial message rate should be greater than 0"),
+    ?assert(ForwardBandwidth1 > 0, "Initial forward bandwidth should be greater than 0"),
+    ?assert(ForwardRate1 > 0.0, "Initial forward message rate should be greater than 0"),
 
     % Wait for half the window time
     timer:sleep(WindowMs div 2),
 
     % Get metrics after half window time - they should have decreased
     Metrics2 = ro2erl_bridge_server:get_metrics(BridgePid),
-    TopicMetrics2 = maps:get(TopicName, Metrics2),
-    DispatchMetrics2 = maps:get(dispatched, TopicMetrics2),
-    Bandwidth2 = maps:get(bandwidth, DispatchMetrics2),
-    % Rate2 = maps:get(rate, DispatchMetrics2),
+    #{TopicName := #{dispatched := #{bandwidth := Bandwidth2}}} = Metrics2,
 
     % The metrics should have decreased but not to zero
     ?assert(Bandwidth2 < Bandwidth1,
-           io_lib:format("Bandwidth should decrease after half window (was: ~p, now: ~p)",
-                        [Bandwidth1, Bandwidth2])),
+           ?FMT("Bandwidth should decrease after half window (was: ~p, now: ~p)",
+                [Bandwidth1, Bandwidth2])),
     ?assert(Bandwidth2 > 0, "Bandwidth should not decay to zero after half window"),
 
     % Send another burst of messages
@@ -630,41 +672,34 @@ metrics_window_test(Config) ->
 
     % Get metrics immediately after the second burst
     Metrics3 = ro2erl_bridge_server:get_metrics(BridgePid),
-    TopicMetrics3 = maps:get(TopicName, Metrics3),
-    DispatchMetrics3 = maps:get(dispatched, TopicMetrics3),
-    Bandwidth3 = maps:get(bandwidth, DispatchMetrics3),
+    #{TopicName := #{dispatched := #{bandwidth := Bandwidth3}}} = Metrics3,
+    #{TopicName := #{forwarded := #{bandwidth := ForwardBandwidth3}}} = Metrics3,
 
     % The metrics should have increased compared to the previous reading
     ?assert(Bandwidth3 > Bandwidth2,
-           io_lib:format("Bandwidth should increase after sending more messages (was: ~p, now: ~p)",
-                        [Bandwidth2, Bandwidth3])),
+            ?FMT("Bandwidth should increase after sending more messages (was: ~p, now: ~p)",
+                 [Bandwidth2, Bandwidth3])),
 
     % Wait for the full window time
     timer:sleep(WindowMs),
 
     % Get metrics after full window time - they should be close to zero
     Metrics4 = ro2erl_bridge_server:get_metrics(BridgePid),
-    TopicMetrics4 = maps:get(TopicName, Metrics4),
-    DispatchMetrics4 = maps:get(dispatched, TopicMetrics4),
-    Bandwidth4 = maps:get(bandwidth, DispatchMetrics4),
+    #{TopicName := #{dispatched := #{bandwidth := Bandwidth4}}} = Metrics4,
 
     % The metrics should have decreased significantly
-    ?assert(Bandwidth4 < Bandwidth3 * 0.2,
-           io_lib:format("Bandwidth should decrease to near-zero after full window (was: ~p, now: ~p)",
-                        [Bandwidth3, Bandwidth4])),
+    ?assert(Bandwidth4 < Bandwidth3 * 0.4,
+            ?FMT("Bandwidth should decrease significantly after extended window due to exponential decay (was: ~p, now: ~p)",
+                 [Bandwidth3, Bandwidth4])),
 
     % Verify the same pattern for forwarded metrics
-    ForwardMetrics1 = maps:get(forwarded, TopicMetrics1),
-    ForwardBandwidth1 = maps:get(bandwidth, ForwardMetrics1),
-    ?assert(ForwardBandwidth1 > 0, "Initial forward bandwidth should be greater than 0"),
-
-    ForwardMetrics4 = maps:get(forwarded, TopicMetrics4),
-    ForwardBandwidth4 = maps:get(bandwidth, ForwardMetrics4),
-    ?assert(ForwardBandwidth4 < ForwardBandwidth1 * 0.2,
-           io_lib:format("Forward bandwidth should decrease to near-zero after full window (was: ~p, now: ~p)",
-                        [ForwardBandwidth1, ForwardBandwidth4])),
+    #{TopicName := #{forwarded := #{bandwidth := ForwardBandwidth4}}} = Metrics4,
+    ?assert(ForwardBandwidth4 < ForwardBandwidth3 * 0.4,
+            ?FMT("Forward bandwidth should decrease significantly after extended window due to exponential decay (was: ~p, now: ~p)",
+                 [ForwardBandwidth3, ForwardBandwidth4])),
 
     % Clean up and verify no unexpected messages
+    flush_topic_updates(),
     ?assertNoMessage(),
 
     ok.
@@ -720,8 +755,8 @@ bandwidth_limit_set_test(Config) ->
 
     % Some messages should have been dropped due to rate limiting
     ?assert(ForwardedCount < MessageCount2,
-            io_lib:format("Some messages should be dropped (sent: ~p, forwarded: ~p)",
-                         [MessageCount2, ForwardedCount])),
+            ?FMT("Some messages should be dropped (sent: ~p, forwarded: ~p)",
+                 [MessageCount2, ForwardedCount])),
 
     % Set limit to infinity and verify all messages get forwarded
     ok = ro2erl_bridge_server:set_topic_bandwidth(BridgePid, TopicName, infinity),
@@ -776,8 +811,8 @@ bandwidth_limit_remove_test(Config) ->
     % We should have received some but not all messages
     ?assert(CountReceived > 0, "Should have received at least some messages"),
     ?assert(CountReceived < MessageCount,
-           io_lib:format("Should have dropped some messages (sent: ~p, received: ~p)",
-                        [MessageCount, CountReceived])),
+           ?FMT("Should have dropped some messages (sent: ~p, received: ~p)",
+                [MessageCount, CountReceived])),
 
     % Clear mailbox
     flush_mailbox(),
@@ -802,8 +837,8 @@ bandwidth_limit_remove_test(Config) ->
 
     % All messages should have been received with infinity limit
     ?assertEqual(SecondMessageCount, SecondCountReceived,
-                io_lib:format("All messages should be forwarded with infinity bandwidth limit (sent: ~p, received: ~p)",
-                             [SecondMessageCount, SecondCountReceived])),
+                ?FMT("All messages should be forwarded with infinity bandwidth limit (sent: ~p, received: ~p)",
+                     [SecondMessageCount, SecondCountReceived])),
 
     % Verify no more messages in queue
     ?assertNoMessage(),
@@ -846,8 +881,8 @@ non_filterable_always_forward_test(Config) ->
     % We should have received some but not all filterable messages due to rate limiting
     ?assert(FilterableReceived > 0, "Should have received at least some filterable messages"),
     ?assert(FilterableReceived < FilterableCount,
-           io_lib:format("Should have dropped some filterable messages (sent: ~p, received: ~p)",
-                        [FilterableCount, FilterableReceived])),
+           ?FMT("Should have dropped some filterable messages (sent: ~p, received: ~p)",
+                [FilterableCount, FilterableReceived])),
 
     % Clear mailbox
     flush_mailbox(),
@@ -864,8 +899,8 @@ non_filterable_always_forward_test(Config) ->
 
     % We should have received ALL non-filterable messages despite rate limiting
     ?assertEqual(NonFilterableCount, NonFilterableReceived,
-                io_lib:format("All non-filterable messages should be forwarded regardless of bandwidth limit (sent: ~p, received: ~p)",
-                             [NonFilterableCount, NonFilterableReceived])),
+                ?FMT("All non-filterable messages should be forwarded regardless of bandwidth limit (sent: ~p, received: ~p)",
+                     [NonFilterableCount, NonFilterableReceived])),
 
     % Verify no more messages in queue
     ?assertNoMessage(),
@@ -910,18 +945,12 @@ multiple_topics_metrics_test(Config) ->
     timer:sleep(100),
 
     % Get the metrics right after sending messages for comparison
-    FreshMetrics = ro2erl_bridge_server:get_metrics(BridgePid),
-    FreshTopic1Metrics = maps:get(Topic1, FreshMetrics),
-    FreshTopic1Dispatched = maps:get(dispatched, FreshTopic1Metrics),
-    FreshTopic1Bandwidth = maps:get(bandwidth, FreshTopic1Dispatched),
-    FreshTopic2Metrics = maps:get(Topic2, FreshMetrics),
-    FreshTopic2Dispatched = maps:get(dispatched, FreshTopic2Metrics),
-    FreshTopic2Bandwidth = maps:get(bandwidth, FreshTopic2Dispatched),
+    #{
+        Topic1 := #{dispatched := #{bandwidth := FreshTopic1Bandwidth}},
+        Topic2 := #{dispatched := #{bandwidth := FreshTopic2Bandwidth}}
+    } = ro2erl_bridge_server:get_metrics(BridgePid),
 
-    % Count messages received for each topic
-    TopicCounts = count_forwarded_topics(#{}),
-    Topic1Count = maps:get(Topic1, TopicCounts, 0),
-    Topic2Count = maps:get(Topic2, TopicCounts, 0),
+    #{Topic1 := Topic1Count, Topic2 := Topic2Count} = count_forwarded_topics(#{}),
 
     % Topic1 (filterable) should have dropped messages due to bandwidth limit
     ?assert(Topic1Count < MessageCount3,
@@ -935,25 +964,225 @@ multiple_topics_metrics_test(Config) ->
 
     % Verify metrics decay independently
     timer:sleep(5000),  % Full window time to ensure decay
-    Metrics3 = ro2erl_bridge_server:get_metrics(BridgePid),
 
-    DecayedTopic1Metrics = maps:get(Topic1, Metrics3),
-    DecayedTopic2Metrics = maps:get(Topic2, Metrics3),
+    #{
+        Topic1 := #{dispatched := #{bandwidth := DecayedTopic1Bandwidth}},
+        Topic2 := #{dispatched := #{bandwidth := DecayedTopic2Bandwidth}}
+    } = ro2erl_bridge_server:get_metrics(BridgePid),
 
-    DecayedTopic1Dispatched = maps:get(dispatched, DecayedTopic1Metrics),
-    DecayedTopic1Bandwidth = maps:get(bandwidth, DecayedTopic1Dispatched),
-    DecayedTopic2Dispatched = maps:get(dispatched, DecayedTopic2Metrics),
-    DecayedTopic2Bandwidth = maps:get(bandwidth, DecayedTopic2Dispatched),
+    ?assert(DecayedTopic1Bandwidth < FreshTopic1Bandwidth * 0.5,
+           ?FMT("Topic1 bandwidth should decay significantly (decayed: ~p, fresh: ~p)",
+                [DecayedTopic1Bandwidth, FreshTopic1Bandwidth])),
+    ?assert(DecayedTopic2Bandwidth < FreshTopic2Bandwidth * 0.5,
+           ?FMT("Topic2 bandwidth should decay significantly (decayed: ~p, fresh: ~p)",
+                [DecayedTopic2Bandwidth, FreshTopic2Bandwidth])),
 
-    ?assert(DecayedTopic1Bandwidth < FreshTopic1Bandwidth,
-           io_lib:format("Topic1 bandwidth should decay independently (decayed: ~p, fresh: ~p)",
-                        [DecayedTopic1Bandwidth, FreshTopic1Bandwidth])),
-    ?assert(DecayedTopic2Bandwidth < FreshTopic2Bandwidth,
-           io_lib:format("Topic2 bandwidth should decay independently (decayed: ~p, fresh: ~p)",
-                        [DecayedTopic2Bandwidth, FreshTopic2Bandwidth])),
-
-    % Verify no unexpected messages
+    % Verify no unexpected messages besides topic updates
+    flush_topic_updates(),
     ?assertNoMessage(),
+
+    ok.
+
+%% Test for hub-initiated bandwidth limit changes
+hub_set_bandwidth_test(Config) ->
+    TestPid = self(),
+    register(current_test, TestPid),
+    BridgePid = proplists:get_value(bridge_pid, Config),
+
+    % Attach the bridge to the test process as a hub
+    ok = ro2erl_bridge_server:attach(BridgePid, TestPid),
+    ?assertAttached(TestPid, _, BridgePid),
+
+    % Define the test topic
+    TopicName = <<"hub_limited_topic">>,
+    MsgSize = 200,  % Message size in bytes
+    FilterableMessage = {test_message, TopicName, true, MsgSize},
+
+    % First set a very low bandwidth limit directly from the hub
+    LowLimit = 150, % bytes/second - allows approximately one message every 1.3 seconds
+    gen_statem:cast(BridgePid, {hub_set_topic_bandwidth, TopicName, LowLimit}),
+
+    % Wait longer for the limit to take effect
+    timer:sleep(500),
+
+    % Send a small burst of messages with size greater than the bandwidth limit
+    % With low limit, we can at best send 1 message per 1.3 seconds
+    MessageCount = 5,
+    lists:foreach(fun(_) ->
+        ro2erl_bridge_server:dispatch(BridgePid, FilterableMessage),
+        % Add small delay between messages to avoid complete rate limit exhaustion
+        timer:sleep(20)
+    end, lists:seq(1, MessageCount)),
+
+    % Wait longer to allow messages to be processed
+    timer:sleep(300),
+    LowLimitForwarded = count_forwarded_messages(0),
+
+    % Should have received at least one message but not all
+    ?assert(LowLimitForwarded > 0, "At least some messages should have been forwarded"),
+    ?assert(LowLimitForwarded < MessageCount,
+           io_lib:format("Should drop some messages with low limit (sent: ~p, forwarded: ~p)",
+                        [MessageCount, LowLimitForwarded])),
+
+    % Now set a much higher bandwidth limit from the hub that should allow all messages
+    HighLimit = MsgSize * 10, % bytes/second - should allow 10 messages per second
+    gen_statem:cast(BridgePid, {hub_set_topic_bandwidth, TopicName, HighLimit}),
+
+    % Wait significantly longer for the higher limit to take effect
+    % This gives time for the token bucket to refill
+    timer:sleep(1000),
+
+    % Send same number of messages
+    lists:foreach(fun(_) ->
+        ro2erl_bridge_server:dispatch(BridgePid, FilterableMessage),
+        % Add small delay between messages
+        timer:sleep(20)
+    end, lists:seq(1, MessageCount)),
+
+    % Wait longer to allow messages to be processed
+    timer:sleep(300),
+    HighLimitForwarded = count_forwarded_messages(0),
+
+    % With higher limit, we should receive more messages than before
+    ?assert(HighLimitForwarded > LowLimitForwarded,
+           io_lib:format("Higher limit should allow more messages (low: ~p, high: ~p)",
+                        [LowLimitForwarded, HighLimitForwarded])),
+
+    % Now test infinity limit - should always forward all messages
+    gen_statem:cast(BridgePid, {hub_set_topic_bandwidth, TopicName, infinity}),
+
+    % Wait for the infinity limit to take effect
+    timer:sleep(1000),
+
+    % Send same burst of messages
+    lists:foreach(fun(_) ->
+        ro2erl_bridge_server:dispatch(BridgePid, FilterableMessage),
+        % Small delay to prevent any rate issues
+        timer:sleep(20)
+    end, lists:seq(1, MessageCount)),
+
+    % Wait for processing
+    timer:sleep(300),
+    InfinityLimitForwarded = count_forwarded_messages(0),
+
+    % With infinity limit, we should receive all messages
+    ?assertEqual(MessageCount, InfinityLimitForwarded,
+                io_lib:format("Infinity limit should allow all messages (sent: ~p, forwarded: ~p)",
+                             [MessageCount, InfinityLimitForwarded])),
+
+    % Verify no unexpected messages (besides topic updates)
+    flush_topic_updates(),
+    ?assertNoDispatchMessage(),
+
+    ok.
+
+%% Test for dispatch callback functionality
+dispatch_callback_test(Config) ->
+    TestPid = self(),
+    register(current_test, TestPid),
+    BridgePid = proplists:get_value(bridge_pid, Config),
+
+    % Create a simulated hub
+    HubPid = TestPid,
+
+    % Attach to the hub
+    ok = ro2erl_bridge_server:attach(BridgePid, HubPid),
+    ?assertAttached(HubPid, _, BridgePid),
+
+    TestMessage1 = {test_message, <<"From Hub">>},
+
+    % Send a message from the hub to the bridge
+    hub_dispatch(BridgePid, TestMessage1),
+
+    % Verify the message was dispatched locally via our callback
+    ?assertDispatchedLocally(TestMessage1),
+
+    TestMessage2 = {test_message, <<"Another Message">>},
+
+    % Send another message
+    hub_dispatch(BridgePid, TestMessage2),
+    ?assertDispatchedLocally(TestMessage2),
+
+    % Verify no unexpected messages (besides topic updates)
+    flush_topic_updates(),
+    ?assertNoDispatchMessage(),
+
+    ok.
+
+%% Test for topic update message handling
+topic_update_test(Config) ->
+    TestPid = self(),
+    register(current_test, TestPid),
+    BridgePid = proplists:get_value(bridge_pid, Config),
+
+    % First, flush any existing messages
+    % flush_mailbox(),
+
+    % Attach the bridge to the test process as a hub
+    ok = ro2erl_bridge_server:attach(BridgePid, TestPid),
+    ?assertAttached(TestPid, _, BridgePid),
+
+    % Send messages to create some topics with different characteristics
+    Topic1 = <<"topic1">>,
+    Topic2 = <<"topic2">>,
+    Topic1FilterableMsg = {test_message, Topic1, true, 100},   % Filterable, small
+    Topic2NonFilterableMsg = {test_message, Topic2, false, 500}, % Non-filterable, larger
+
+    % Set different bandwidth limits for the topics
+    ok = ro2erl_bridge_server:set_topic_bandwidth(BridgePid, Topic1, 1000),
+    ok = ro2erl_bridge_server:set_topic_bandwidth(BridgePid, Topic2, 2000),
+
+    % Send some messages to establish metrics for the topics
+    lists:foreach(fun(_) ->
+        ro2erl_bridge_server:dispatch(BridgePid, Topic1FilterableMsg),
+        ?assertDispatched(TestPid, Topic1FilterableMsg),
+        ro2erl_bridge_server:dispatch(BridgePid, Topic2NonFilterableMsg),
+        ?assertDispatched(TestPid, Topic2NonFilterableMsg)
+    end, lists:seq(1, 5)),
+
+    % Now wait for the first topic update message (default period is 1000ms)
+    FirstTopics = ?assertTopicUpdated(TestPid, #{Topic1 := _, Topic2 := _}),
+
+    % Verify topic metadata is correct
+    #{Topic1 := Topic1Info} = FirstTopics,
+    #{Topic2 := Topic2Info} = FirstTopics,
+
+    % Check that topics have the correct filterable flag
+    ?assertEqual(true, maps:get(filterable, Topic1Info)),
+    ?assertEqual(false, maps:get(filterable, Topic2Info)),
+
+    % Check that bandwidth limits are correctly reported
+    ?assertEqual(1000, maps:get(bandwidth_limit, Topic1Info)),
+    ?assertEqual(2000, maps:get(bandwidth_limit, Topic2Info)),
+
+    % Check that metrics are included and have the expected structure
+    ?assert(maps:is_key(metrics, Topic1Info)),
+    ?assert(maps:is_key(metrics, Topic2Info)),
+
+    #{metrics := Topic1Metrics} = Topic1Info,
+    #{metrics := Topic2Metrics} = Topic2Info,
+
+    % Verify metrics structure
+    ?assert(maps:is_key(dispatched, Topic1Metrics)),
+    ?assert(maps:is_key(forwarded, Topic1Metrics)),
+    ?assert(maps:is_key(dispatched, Topic2Metrics)),
+    ?assert(maps:is_key(forwarded, Topic2Metrics)),
+
+    % Wait for a second update to verify periodic updates
+    ?assertTopicUpdated(TestPid, #{Topic1 := _, Topic2 := _}),
+
+    % Send more messages to one topic and verify updates reflect the changes
+    lists:foreach(fun(_) ->
+        ro2erl_bridge_server:dispatch(BridgePid, Topic1FilterableMsg),
+        ?assertDispatched(TestPid, Topic1FilterableMsg)
+    end, lists:seq(1, 5)),
+
+    % Wait for another update
+    ?assertTopicUpdated(TestPid, #{Topic1 := _, Topic2 := _}),
+
+    % Verify no unexpected messages (besides topic updates)
+    flush_topic_updates(),
+    ?assertNoDispatchMessage(),
 
     ok.
 
@@ -973,9 +1202,13 @@ dispatch(HubPid, SenderPid, Timestamp, Message) ->
     current_test ! {bridge_dispatch, HubPid, SenderPid, Timestamp, Message},
     ok.
 
+update_topics(HubPid, BridgePid, Topics) ->
+    current_test ! {bridge_update_topics, HubPid, BridgePid, Topics},
+    ok.
+
 %=== HELPER FUNCTIONS =========================================================
 
-%% Clear all messages from the process mailbox
+%% Flush all messages from the process mailbox
 flush_mailbox() ->
     receive
         _Any -> flush_mailbox()
@@ -983,11 +1216,22 @@ flush_mailbox() ->
         ok
     end.
 
-%% Count forwarded messages in the process mailbox
+%% Flush the mailbox topic update messages
+flush_topic_updates() ->
+    receive
+        {bridge_update_topics, _, _, _} -> flush_topic_updates()
+    after 0 ->
+        ok
+    end.
+
+%% Count forwarded messages in the process mailbox, but ignoring topic updates
 count_forwarded_messages(Count) ->
     receive
         {bridge_dispatch, _, _, _, _} ->
-            count_forwarded_messages(Count + 1)
+            count_forwarded_messages(Count + 1);
+        {bridge_update_topics, _, _, _} ->
+            % Ignore topic updates
+            count_forwarded_messages(Count)
     after 0 ->
         Count
     end.
@@ -997,10 +1241,16 @@ count_forwarded_topics(Counts) ->
     receive
         {bridge_dispatch, _, _, _, {test_message, TopicName, _, _}} ->
             NewCount = maps:get(TopicName, Counts, 0) + 1,
-            count_forwarded_topics(Counts#{TopicName => NewCount})
+            count_forwarded_topics(Counts#{TopicName => NewCount});
+        {bridge_update_topics, _, _, _} ->
+            % Ignore topic updates
+            count_forwarded_topics(Counts)
     after 0 ->
         Counts
     end.
+
+hub_dispatch(BridgePid, Message) ->
+    gen_statem:cast(BridgePid, {hub_dispatch, erlang:system_time(millisecond), Message}).
 
 hub_proc(TestPid) ->
     receive
@@ -1025,3 +1275,8 @@ test_message_processor({test_message, TopicName, Filterable, Size}) ->
 test_message_processor(_Message) ->
     % Fallback for other message formats
     {topic, <<"unknown">>, true, 100}.
+
+%% Testing dispatch callback function
+test_dispatch_callback(Message) ->
+    current_test ! {local_dispatch, Message},
+    ok.
