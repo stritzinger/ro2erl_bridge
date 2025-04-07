@@ -98,13 +98,22 @@ The bridge utilizes Erlang's process group (`pg`) module to discover hub process
 
 ### Message Processing
 - Expects messages to be in rosie client format
-- Uses a configurable message processor to extract topic information
+- Uses a configurable message processor to extract topic information and provide the payload to be sent to the hub
+- Message processor must return `{topic, TopicName, Filterable, MsgSize, Payload}`
+- Payload returned by the processor is what gets sent to the hub (not the original message)
 - Classifies topics as filterable or non-filterable
 - Tracks bandwidth usage per topic using a rolling window algorithm
 - Applies bandwidth limits to filterable topics
 - Adds timestamps to outgoing messages
 - Forwards messages to all attached hubs
 - Relies on bridges to understand the rosie client message format
+
+The enhanced message processor allows for message transformation at the bridge level, enabling:
+- Data format conversion (e.g., binary to JSON, ROS2 messages to custom formats)
+- Payload filtering or enrichment
+- Message compression or size reduction
+- Encryption or secure encoding of sensitive data
+- Protocol adaptation between different bridge implementations
 
 ### Metrics and Filtering
 
@@ -196,7 +205,7 @@ The bridge implements a sophisticated metrics and filtering system:
   - Called when messages are received from the hub
 - **Message Processor:** Function to extract topic information from messages
   - Specified as `{Module, Function}` or `{Module, Function, Args}`
-  - Must return `{topic, TopicName, Filterable, MsgSize}`
+  - Must return `{topic, TopicName, Filterable, MsgSize, Payload}`
   - Used to process messages before forwarding to the hub
   - Determines if topic is filterable and calculates message size
 

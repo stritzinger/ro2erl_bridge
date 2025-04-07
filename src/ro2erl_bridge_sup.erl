@@ -45,8 +45,8 @@ init([]) ->
     % Get message processor from config or use default
     MsgProcessor = case application:get_env(ro2erl_bridge, msg_processor) of
         undefined ->
-            % Default processor that always returns unknown topic
-            fun(_) -> {topic, <<"unknown">>, false, 0} end;
+            % Default processor that always returns unknown topic with original message as payload
+            fun(Msg) -> {topic, <<"unknown">>, false, 0, Msg} end;
         {ok, {ProcM, ProcF}} ->
             fun(Msg) -> ProcM:ProcF(Msg) end;
         {ok, {ProcM, ProcF, ProcA}} ->

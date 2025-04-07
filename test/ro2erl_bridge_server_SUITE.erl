@@ -38,7 +38,9 @@
     % Future test cases
     hub_set_bandwidth_test/1,
     dispatch_callback_test/1,
-    topic_update_test/1
+    topic_update_test/1,
+    % Custom payload test
+    custom_payload_test/1
 ]).
 
 %% Test Hub API - Used by the bridge
@@ -151,7 +153,9 @@ all() -> [
     % Future test cases
     hub_set_bandwidth_test,
     dispatch_callback_test,
-    topic_update_test
+    topic_update_test,
+    % Custom payload test
+    custom_payload_test
 ].
 
 init_per_suite(Config) ->
@@ -1186,6 +1190,46 @@ topic_update_test(Config) ->
 
     ok.
 
+%% Custom payload test
+custom_payload_test(Config) ->
+    TestPid = self(),
+    register(current_test, TestPid),
+
+    % Get the bridge PID
+    BridgePid = proplists:get_value(bridge_pid, Config),
+
+    % Create a hub process
+    Hub = spawn(fun() -> hub_proc(TestPid) end),
+
+    % Attach to the hub
+    ok = ro2erl_bridge_server:attach(BridgePid, Hub),
+    ?assertConnected(BridgePid),
+    ?assertAttached(Hub, _, BridgePid),
+
+    % Test case: Standard message with implicit payload (using original message)
+    OriginalMsg = {test_message, <<"test_topic">>, true, 100},
+    ro2erl_bridge_server:dispatch(BridgePid, OriginalMsg),
+
+    % Verify hub received the original message as payload
+    ?assertDispatched(Hub, OriginalMsg),
+
+    % Test case: Message with explicit custom payload
+    CustomPayloadMsg = {test_message, <<"test_topic2">>, true, 200, <<"custom_payload">>},
+    ExpectedPayload = <<"custom_payload">>,
+    ro2erl_bridge_server:dispatch(BridgePid, CustomPayloadMsg),
+
+    % Verify hub received the custom payload
+    ?assertDispatched(Hub, ExpectedPayload),
+
+    % Cleanup
+    ok = ro2erl_bridge_server:detach(BridgePid, Hub),
+    ?assertDetached(Hub, BridgePid),
+
+    Hub ! stop,
+    ?assertNoMessage(),
+
+    ok.
+
 
 %=== HUB API IMPLEMENTATION ===================================================
 
@@ -1268,13 +1312,17 @@ hub_proc(TestPid) ->
     end.
 
 %% Testing message processor that expects test messages
-%% in the format {test_message, TopicName, Filterable, Size}
-%% or the simpler format {test_message, TopicName} for backward compatibility
+%% in the format {test_message, TopicName, Filterable, Size, CustomPayload} or similar formats
+%% If CustomPayload is provided, it's used; otherwise the original message is used as payload
+test_message_processor({test_message, TopicName, Filterable, Size, CustomPayload}) ->
+    % Format with custom payload specified
+    {topic, TopicName, Filterable, Size, CustomPayload};
 test_message_processor({test_message, TopicName, Filterable, Size}) ->
-    {topic, TopicName, Filterable, Size};
-test_message_processor(_Message) ->
-    % Fallback for other message formats
-    {topic, <<"unknown">>, true, 100}.
+    % Format without custom payload - use message as its own payload
+    {topic, TopicName, Filterable, Size, {test_message, TopicName, Filterable, Size}};
+test_message_processor(Message) ->
+    % Fallback for other message formats - use message as its own payload
+    {topic, <<"unknown">>, true, 100, Message}.
 
 %% Testing dispatch callback function
 test_dispatch_callback(Message) ->

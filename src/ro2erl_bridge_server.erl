@@ -71,7 +71,7 @@ This module is responsible for:
     local_callback :: undefined | fun((term()) -> ok),
     bridge_id :: undefined | binary(),
     topics = #{} :: #{Name ::binary() => #topic{}},
-    msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer()}),
+    msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer(), term()}),
     topic_update_timer :: undefined | reference()   % Timer reference for topic updates
 }).
 
@@ -282,8 +282,8 @@ connected({call, From}, {detach, HubPid}, Data) ->
     end;
 connected(cast, {dispatch, Message},
           Data = #data{topics = Topics, msg_processor = MsgProcessor}) ->
-    % Process message to get topic info
-    {topic, TopicName, Filterable, MsgSize} = MsgProcessor(Message),
+    % Process message to get topic info and payload to forward
+    {topic, TopicName, Filterable, MsgSize, MsgToForward} = MsgProcessor(Message),
 
     % Get or create topic record
     Topic = case maps:find(TopicName, Topics) of
@@ -314,7 +314,7 @@ connected(cast, {dispatch, Message},
             FinalTopic = update_forward_metrics(UpdatedTopic, MsgSize),
             FinalTopics = NewTopics#{TopicName => FinalTopic},
             FinalData = NewData#data{topics = FinalTopics},
-            forward_to_all_hubs(Message, FinalData),
+            forward_to_all_hubs(MsgToForward, FinalData),
             {keep_state, FinalData};
         false ->
             ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p, remaining=~p",
