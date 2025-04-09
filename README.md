@@ -51,24 +51,51 @@ Where:
 
 ## Development
 
-For local development and testing:
+### Start Without TLS Distribution
+
+Start an interactive shell with debug logging and a specific node name:
 
 ```bash
-# Start an interactive shell with debug logging and a specific node name
 rebar3 shell --sname bridge@localhost --setcookie targetx
-
-% In the Erlang shell, connect to the hub
-1> net_adm:ping('hub@localhost').
-pong
-
-% Dispatch a message to the hub
-2> ro2erl_bridge:dispatch(foobar).
-
-# Run tests
-rebar3 ct
 ```
 
-The bridge node will be started with the short name `bridge` and the cookie `targetx`. The `net_adm:ping/1` call establishes the connection between the nodes, and then the bridge will attach automatically.
+### Start With TLS Distribution
+
+To start a local development shell with support for TLS distribution, you need
+first to generate a testing CA and certificate:
+
+```bash
+local/setup.sh ../ro2erl_hub
+```
+
+Then you can start the shell with:
+
+```bash
+ERL_FLAGS='-proto_dist inet_tls -ssl_dist_optfile local/ssl_dist_opts.rel -connect_all false' rebar3 as local shell --name bridge --setcookie targetx
+```
+
+### Connecting to Hub
+
+In the Erlang shell, connect to the hub:
+
+```erlang
+1> net_adm:ping(list_to_atom("hub@" ++ lists:nth(2, string:split(atom_to_list(node()), "@")))).
+pong
+```
+
+### API
+
+Dispatch a message to the hub:
+
+```erlang
+2> ro2erl_bridge:dispatch(foobar).
+```
+
+## Run tests
+
+```bash
+rebar3 ct
+```
 
 ## Production Deployment
 
@@ -118,4 +145,6 @@ handle_message(Message) ->
 
 ## License
 
-Apache License 2.0
+Copyright © 2025 Stritzinger GmbH
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) file for details.

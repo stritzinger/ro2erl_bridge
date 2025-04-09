@@ -1,0 +1,12 @@
+# This extensions will be added to the signed certificate
+basicConstraints = CA:FALSE
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+keyUsage = digitalSignature, keyEncipherment, keyAgreement
+subjectAltName = @alt_names
+
+[ alt_names ]
+IP.0 = 127.0.0.1
+DNS.0 = localhost
+DNS.1 = 127.0.0.1
+DNS.2 = $HOSTNAME

@@ -1,0 +1,15 @@
+# end-entity Server certificate
+[ req ]
+prompt                 = no
+days                   = 3650
+default_md             = sha256
+distinguished_name     = req_distinguished_name
+
+[ req_distinguished_name ]
+countryName            = DE
+stateOrProvinceName    = Bavaria
+localityName           = Munich
+organizationName       = Dipl. Phys. Peer Stritzinger Gmbh
+organizationalUnitName = Developement
+commonName             = $FQDN
+emailAddress           = test@example.net

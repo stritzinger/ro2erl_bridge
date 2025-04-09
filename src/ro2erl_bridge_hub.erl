@@ -9,6 +9,8 @@ access to the ro2erl_hub application, this module uses gen_statem calls
 to communicate with the hub.
 """.
 
+%=== EXPORTS ===================================================================
+
 %% API functions
 -export([attach/3]).
 -export([detach/2]).
