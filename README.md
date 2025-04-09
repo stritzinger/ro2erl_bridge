@@ -71,7 +71,7 @@ local/setup.sh ../ro2erl_hub
 Then you can start the shell with:
 
 ```bash
-ERL_FLAGS='-proto_dist inet_tls -ssl_dist_optfile local/ssl_dist_opts.rel -connect_all false' rebar3 as local shell --name bridge --setcookie targetx
+ERL_FLAGS='-proto_dist inet_tls -ssl_dist_optfile local/ssl_dist_opts.rel -connect_all false' rebar3 as local shell --sname bridge --setcookie targetx
 ```
 
 ### Connecting to Hub
