@@ -56,7 +56,7 @@ Where:
 Start an interactive shell with debug logging and a specific node name:
 
 ```bash
-rebar3 shell --sname bridge@localhost --setcookie targetx
+rebar3 shell --sname bridge --setcookie targetx
 ```
 
 ### Start With TLS Distribution
