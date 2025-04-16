@@ -42,16 +42,38 @@ Parameters:
 - Limit: Bandwidth limit in bytes per second (byte/s). When set to infinity, no limit is applied.
 - MsgSize: Size of new message in bytes, or undefined for decay-only updates
 
-If MsgSize is undefined, the metrics will not be updated with new data. The function
-will only decay existing values and refill the buckets based on the time elapsed
-since the last update.
-
-Returns:
+Return Values:
+- Action: Indicates how to handle the message:
+  - 'forward': The message should be processed and forwarded. Returned when:
+    - MsgSize is defined AND
+    - Either Limit is infinity OR
+    - Adding the message would not exceed the calculated capacity
+  - 'drop': The message should be discarded. Returned when:
+    - MsgSize is defined AND
+    - Limit is a finite number AND
+    - Adding the message would exceed the calculated capacity
+  - 'undefined': No action needed. Returned when:
+    - MsgSize is undefined (decay-only update)
 - NewBytes: Updated accumulated bytes after decay and new message
 - NewMsgCount: Updated message count after decay and new message
 - Bandwidth: Current bandwidth in bytes per second
 - MsgRate: Current message rate in messages per second
-- Capacity: Remaining capacity in bytes for the current window, or infinity if no limit
+
+The capacity of the token bucket is calculated as: Limit * WINDOW_SIZE / 1000
+For example, with a Limit of 1000 bytes/s and a window of 5000ms, the capacity
+would be 5000 bytes in the window.
+
+### Examples:
+```
+% Update metrics with a new 100-byte message
+{Action, NewBytes, NewCount, BW, Rate} = ro2erl_bridge_metrics:update(
+    LastTime, erlang:system_time(millisecond), OldBytes, OldCount, 10000, 100)
+
+% Just decay existing metrics without a new message
+{undefined, DecayedBytes, DecayedCount, CurrentBW, CurrentRate} =
+    ro2erl_bridge_metrics:update(LastTime, erlang:system_time(millisecond),
+    OldBytes, OldCount, Limit, undefined)
+```
 """.
 -spec update(LastUpdate :: non_neg_integer(),
              Now :: non_neg_integer(),
@@ -60,11 +82,11 @@ Returns:
              Limit :: non_neg_integer() | infinity,
              MsgSize :: undefined | non_neg_integer()) ->
     {
+        Action :: forward | drop | undefined,
         NewBytes :: non_neg_integer(),
         NewMsgCount :: float(),
         Bandwidth :: non_neg_integer(),
-        MsgRate :: float(),
-        Capacity :: non_neg_integer() | infinity
+        MsgRate :: float()
     }.
 update(LastUpdate, Now, Bytes, MsgCount, Limit, MsgSize) ->
     % Calculate time elapsed since last update
@@ -75,12 +97,27 @@ update(LastUpdate, Now, Bytes, MsgCount, Limit, MsgSize) ->
     DecayedBytes = max(0, round(Bytes - Bytes * Delta / ?METRIC_WINDOW)),
     DecayedMsgs = max(0.0, MsgCount - MsgCount * Delta / ?METRIC_WINDOW),
 
-    % Add new message if size is provided
-    {NewBytes, NewMsgCount} = case MsgSize of
-        undefined ->
-            {DecayedBytes, DecayedMsgs};
-        Size when is_integer(Size), Size >= 0 ->
-            {DecayedBytes + Size, DecayedMsgs + 1.0}
+    % Determine if we should forward this message based on limit
+    {Action, NewBytes, NewMsgCount} = case {MsgSize, Limit} of
+        {undefined, _} ->
+            % Just querying metrics, no message to process
+            {undefined, DecayedBytes, DecayedMsgs};
+        {_, infinity} ->
+            % No limit, always forward
+            {forward, DecayedBytes + MsgSize, DecayedMsgs + 1.0};
+        {Size, L} when is_integer(Size), is_integer(L) ->
+            % Calculate window capacity
+            Capacity = round(L * ?METRIC_WINDOW / 1000),
+            % Check if message would exceed capacity
+            ShouldForward = DecayedBytes + Size =< Capacity,
+            case ShouldForward of
+                true ->
+                    % Forward and count the message
+                    {forward, DecayedBytes + Size, DecayedMsgs + 1.0};
+                false ->
+                    % Drop the message, but still return the decayed values
+                    {drop, DecayedBytes, DecayedMsgs}
+            end
     end,
 
     % Calculate current rates per-second
@@ -90,11 +127,4 @@ update(LastUpdate, Now, Bytes, MsgCount, Limit, MsgSize) ->
         _ -> 0.0
     end,
 
-    % Calculate remaining capacity based on limit
-    Capacity = case Limit of
-        infinity -> infinity;
-        L when is_integer(L), L > 0 ->
-            max(0, round(L * ?METRIC_WINDOW / 1000 - NewBytes))
-    end,
-
-    {NewBytes, NewMsgCount, Bandwidth, MsgRate, Capacity}.
+    {Action, NewBytes, NewMsgCount, Bandwidth, MsgRate}.

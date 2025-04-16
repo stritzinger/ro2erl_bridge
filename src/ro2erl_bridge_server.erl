@@ -293,33 +293,34 @@ connected(cast, {dispatch, Message},
             ExistingTopic#topic{filterable = Filterable}
     end,
 
-    % Update dispatch metrics and check capacity
-    {Capacity, UpdatedTopic} = update_dispatch_metrics(Topic, MsgSize),
+    % First update dispatch metrics (always counts all messages)
+    {_, _DispatchBandwidth, _DispatchRate, UpdatedTopic} =
+        update_dispatch_metrics(Topic, MsgSize),
 
-    % Update topics map
+    % Update topics map with dispatch metrics
     NewTopics = Topics#{TopicName => UpdatedTopic},
     NewData = Data#data{topics = NewTopics},
 
-    % Check if we can forward the message
-    % Always forward if not filterable, otherwise check capacity
-    ForwardMessage = case {Filterable, Capacity} of
-        {false, _} -> true;
-        {true, infinity} -> true;
-        {true, Remaining} when Remaining >= MsgSize -> true;
-        _ -> false
-    end,
-    case ForwardMessage of
-        true ->
-            % Update forward metrics and forward message
-            FinalTopic = update_forward_metrics(UpdatedTopic, MsgSize),
-            FinalTopics = NewTopics#{TopicName => FinalTopic},
-            FinalData = NewData#data{topics = FinalTopics},
+    % Get forwarding action and update forward metrics
+    % For non-filterable topics, update_forward_metrics uses infinity as limit
+    % and will always return 'forward' as the action
+    {Action, _ForwardBandwidth, _ForwardRate, FinalTopic} =
+        update_forward_metrics(UpdatedTopic, MsgSize),
+
+    % Update topics with forward metrics
+    FinalTopics = NewTopics#{TopicName => FinalTopic},
+    FinalData = NewData#data{topics = FinalTopics},
+
+    % Check if we should forward based on the action
+    case Action of
+        forward ->
+            % Forward the message to all hubs
             forward_to_all_hubs(MsgToForward, FinalData),
             {keep_state, FinalData};
-        false ->
-            ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p, remaining=~p",
-                      [TopicName, MsgSize, Capacity]),
-            {keep_state, NewData}
+        drop ->
+            ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p",
+                       [TopicName, MsgSize]),
+            {keep_state, FinalData}
     end;
 connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
     % Handle message from hub by dispatching it to the local callback
@@ -588,28 +589,28 @@ get_topic_timestamps(Topic = #topic{
 Update topic metrics after message dispatch using a rolling window algorithm.
 
 This function should be called after a message is received from the local network.
-The function returns the remaining capacity for the topic within the current time window.
-For infinite limits, it returns infinity. For finite limits, it calculates how many bytes
-can still be dispatched in the current window before hitting the limit.
+The function returns action, bandwidth, and message rate for the topic within the current time window.
 """.
 -spec update_dispatch_metrics(Topic :: #topic{}, MsgSize :: non_neg_integer()) ->
     {
-        Remaining :: non_neg_integer() | infinity,
+        Action :: forward | drop | undefined,
+        Bandwidth :: non_neg_integer(),
+        MsgRate :: float(),
         NewTopic  :: #topic{}
     }.
 update_dispatch_metrics(Topic, MsgSize) ->
     #topic{
         bytes_dispatched = Bytes,
-        msgs_dispatched = Msgs,
-        limit = Limit
+        msgs_dispatched = Msgs
     } = Topic,
 
     % Get current time and handle NTP time adjustments
     {Now, Last, _, UpdatedTopic} = get_topic_timestamps(Topic),
 
-    % Update metrics using the metrics module
-    {NewBytes, NewMsgs, _Bandwidth, _MsgRate, Capacity}
-        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, Limit, MsgSize),
+    % Update metrics using the metrics module using infinity as limit
+    % (for dispatch bucket, we always want to count all messages)
+    {Action, NewBytes, NewMsgs, Bandwidth, MsgRate}
+        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, infinity, MsgSize),
 
     % Update topic record with new values
     NewTopic = UpdatedTopic#topic{
@@ -617,34 +618,56 @@ update_dispatch_metrics(Topic, MsgSize) ->
         bytes_dispatched = NewBytes,
         msgs_dispatched = NewMsgs
     },
-    {Capacity, NewTopic}.
+    {Action, Bandwidth, MsgRate, NewTopic}.
 
 -doc """
-Update topic metrics after message forwarding using a rolling window algorithm.
+Update topic metrics for potential message forwarding using a rolling window algorithm.
 
-This function should be called after a message is forwarded to the hub.
+This function is used to determine whether a message should be forwarded to hubs
+and to track forwarding metrics. It returns an action (forward/drop), bandwidth,
+and message rate for the topic, based on the configured limit for the topic.
+
+For filterable topics, the returned Action determines whether the message should
+be forwarded. For non-filterable topics, the function always uses 'infinity' as
+the limit (regardless of the topic's configured limit) to ensure the Action is
+always 'forward'.
 """.
 -spec update_forward_metrics(Topic :: #topic{}, MsgSize :: non_neg_integer()) ->
-    #topic{}.
+    {
+        Action :: forward | drop | undefined,
+        Bandwidth :: non_neg_integer(),
+        MsgRate :: float(),
+        NewTopic  :: #topic{}
+    }.
 update_forward_metrics(Topic, MsgSize) ->
     #topic{
         bytes_forwarded = Bytes,
-        msgs_forwarded = Msgs
+        msgs_forwarded = Msgs,
+        limit = Limit,
+        filterable = Filterable
     } = Topic,
 
     % Get current time and handle NTP time adjustments
     {Now, _, Last, UpdatedTopic} = get_topic_timestamps(Topic),
 
-    % Update metrics using the metrics module
-    {NewBytes, NewMsgs, _Bandwidth, _MsgRate, _Capacity}
-        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, infinity, MsgSize),
+    % For non-filterable topics, use infinity as the limit to ensure 'forward' action
+    % For filterable topics, use the topic's configured limit
+    EffectiveLimit = case Filterable of
+        false -> infinity;
+        true -> Limit
+    end,
+
+    % Update metrics using the metrics module with the appropriate limit
+    {Action, NewBytes, NewMsgs, Bandwidth, MsgRate}
+        = ro2erl_bridge_metrics:update(Last, Now, Bytes, Msgs, EffectiveLimit, MsgSize),
 
     % Update topic record with new values
-    UpdatedTopic#topic{
+    NewTopic = UpdatedTopic#topic{
         forward_last_update = Now,
         bytes_forwarded = NewBytes,
         msgs_forwarded = NewMsgs
-    }.
+    },
+    {Action, Bandwidth, MsgRate, NewTopic}.
 
 -doc """
 Get current bandwidth and message rate estimates for a topic.
@@ -668,19 +691,20 @@ get_topic_metrics(Topic) ->
         bytes_dispatched = DBytes,
         msgs_dispatched = DMsgs,
         bytes_forwarded = FBytes,
-        msgs_forwarded = FMsgs,
-        limit = Limit
+        msgs_forwarded = FMsgs
     } = Topic,
 
     % Get current time and handle NTP time adjustments
     {Now, DLast, FLast, UpdatedTopic} = get_topic_timestamps(Topic),
 
-    % Calculate current metrics for dispatched data
-    {NewDBytes, NewDMsgs, DBandwidth, DRate, _}
-        = ro2erl_bridge_metrics:update(DLast, Now, DBytes, DMsgs, Limit, undefined),
+    % Calculate current metrics for dispatched data - use infinity since we count all messages
+    {_, NewDBytes, NewDMsgs, DBandwidth, DRate}
+        = ro2erl_bridge_metrics:update(DLast, Now, DBytes, DMsgs, infinity, undefined),
 
     % Calculate current metrics for forwarded data
-    {NewFBytes, NewFMsgs, FBandwidth, FRate, _}
+    % Since MsgSize is undefined, the limit is not used for decision making
+    % so we can use infinity to simplify the code and maintain consistency
+    {_, NewFBytes, NewFMsgs, FBandwidth, FRate}
         = ro2erl_bridge_metrics:update(FLast, Now, FBytes, FMsgs, infinity, undefined),
 
     % Build metrics map
