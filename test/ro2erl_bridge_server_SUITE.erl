@@ -40,12 +40,15 @@
     dispatch_callback_test/1,
     topic_update_test/1,
     % Custom payload test
-    custom_payload_test/1
+    custom_payload_test/1,
+    % Direct connect tests
+    direct_connect_peer_dispatch_test/1
 ]).
 
 %% Test Hub API - Used by the bridge
 -export([
     attach/3,
+    attach/4,
     detach/2,
     dispatch/4,
     update_topics/3
@@ -155,7 +158,9 @@ all() -> [
     dispatch_callback_test,
     topic_update_test,
     % Custom payload test
-    custom_payload_test
+    custom_payload_test,
+    % Direct connect tests
+    direct_connect_peer_dispatch_test
 ].
 
 init_per_suite(Config) ->
@@ -165,6 +170,9 @@ end_per_suite(Config) ->
     Config.
 
 init_per_testcase(dispatch_callback_test, Config) ->
+    init_base_testcase(Config, fun test_dispatch_callback/1);
+init_per_testcase(direct_connect_peer_dispatch_test, Config) ->
+    application:set_env(ro2erl_bridge, direct_connect, true),
     init_base_testcase(Config, fun test_dispatch_callback/1);
 init_per_testcase(_TestCase, Config) ->
     init_base_testcase(Config, undefined).
@@ -186,6 +194,7 @@ end_per_testcase(_TestCase, Config) ->
 
     % Clear any test app env
     application:unset_env(ro2erl_bridge, dispatch_callback),
+    application:unset_env(ro2erl_bridge, direct_connect),
 
     Config.
 
@@ -1230,6 +1239,31 @@ custom_payload_test(Config) ->
 
     ok.
 
+%% Direct connect mode: ensure peer dispatch goes through and hub is not used
+direct_connect_peer_dispatch_test(Config) ->
+    TestPid = self(),
+    register(current_test, TestPid),
+
+    BridgePid = proplists:get_value(bridge_pid, Config),
+
+    % Simulate hub assigning a peer (same node for test purposes)
+    gen_statem:cast(BridgePid, {hub_add_peer, node(), #{}}),
+    % Force processing of the cast before dispatching
+    _ = ro2erl_bridge_server:get_metrics(BridgePid),
+
+    TestMessage = {test_message, <<"dc_topic">>, true, 50},
+
+    % Dispatch a message; in direct mode this should loop back via peer_dispatch
+    ro2erl_bridge_server:dispatch(BridgePid, TestMessage),
+
+    % Verify it was dispatched locally via the dispatch callback
+    ?assertDispatchedLocally(TestMessage),
+
+    % No hub dispatch should occur in this test setup
+    ?assertNoDispatchMessage(),
+
+    ok.
+
 
 %=== HUB API IMPLEMENTATION ===================================================
 
@@ -1237,6 +1271,9 @@ custom_payload_test(Config) ->
 attach(HubPid, BridgeId, BridgePid) ->
     current_test ! {bridge_attach, HubPid, BridgeId, BridgePid},
     ok.
+
+attach(HubPid, BridgeId, BridgePid, _Opts) ->
+    attach(HubPid, BridgeId, BridgePid).
 
 detach(HubPid, BridgePid) ->
     current_test ! {bridge_detach, HubPid, BridgePid},

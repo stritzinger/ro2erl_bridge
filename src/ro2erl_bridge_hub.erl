@@ -12,7 +12,7 @@ to communicate with the hub.
 %=== EXPORTS ===================================================================
 
 %% API functions
--export([attach/3]).
+-export([attach/3, attach/4]).
 -export([detach/2]).
 -export([dispatch/4]).
 -export([update_topics/3]).
@@ -63,7 +63,12 @@ ok
 """.
 -spec attach(HubPid :: pid(), BridgeId :: binary(), BridgePid :: pid()) -> ok.
 attach(HubPid, BridgeId, BridgePid) when is_pid(HubPid), is_binary(BridgeId), is_pid(BridgePid) ->
-    gen_statem:cast(HubPid, {bridge_attach, BridgeId, BridgePid}),
+    attach(HubPid, BridgeId, BridgePid, #{}).
+
+-spec attach(HubPid :: pid(), BridgeId :: binary(), BridgePid :: pid(), Opts :: map()) -> ok.
+attach(HubPid, BridgeId, BridgePid, Opts)
+  when is_pid(HubPid), is_binary(BridgeId), is_pid(BridgePid), is_map(Opts) ->
+    gen_statem:cast(HubPid, {bridge_attach, BridgeId, BridgePid, Opts}),
     ok.
 
 -doc """
