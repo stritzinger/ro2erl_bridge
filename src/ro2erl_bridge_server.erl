@@ -72,7 +72,9 @@ This module is responsible for:
     bridge_id :: undefined | binary(),
     topics = #{} :: #{Name ::binary() => #topic{}},
     msg_processor :: fun((term()) -> {topic, binary(), boolean(), non_neg_integer(), term()}),
-    topic_update_timer :: undefined | reference()   % Timer reference for topic updates
+    topic_update_timer :: undefined | reference(),   % Timer reference for topic updates
+    direct_connect = false :: boolean(),
+    peers = #{} :: #{node() => map()}
 }).
 
 
@@ -225,6 +227,9 @@ set_topic_bandwidth(ServerRef, TopicName, Bandwidth) ->
 callback_mode() -> [state_functions].
 
 init([HubMod, MsgProcessor, DispatchCallback]) ->
+    DirectConnect = get_direct_connect(),
+    maybe_monitor_nodes(DirectConnect),
+
     % Generate a unique bridge ID
     BridgeId = generate_bridge_id(),
 
@@ -234,7 +239,9 @@ init([HubMod, MsgProcessor, DispatchCallback]) ->
         hub_mod = HubMod,
         local_callback = DispatchCallback,
         bridge_id = BridgeId,
-        msg_processor = MsgProcessor
+        msg_processor = MsgProcessor,
+        direct_connect = DirectConnect,
+        peers = #{}
     }}.
 
 terminate(_Reason, _State, Data) ->
@@ -248,9 +255,15 @@ code_change(_Vsn, State, Data, _Extra) ->
 
 %=== STATE FUNCTIONS =========================================================
 
-disconnected(cast, {dispatch, _Message}, _Data) ->
-    ?LOG_WARNING("Cannot forward message to hub: not connected"),
-    keep_state_and_data;
+disconnected(cast, {dispatch, Message}, Data = #data{direct_connect = Direct}) ->
+    case Direct of
+        true ->
+            handle_dispatch(Message, Data),
+            keep_state_and_data;
+        false ->
+            ?LOG_WARNING("Cannot forward message to hub: not connected"),
+            keep_state_and_data
+    end;
 disconnected({call, From}, is_connected, _Data) ->
     {keep_state_and_data, [{reply, From, false}]};
 disconnected({call, From}, {detach, _HubPid}, _Data) ->
@@ -281,47 +294,8 @@ connected({call, From}, {detach, HubPid}, Data) ->
             end
     end;
 connected(cast, {dispatch, Message},
-          Data = #data{topics = Topics, msg_processor = MsgProcessor}) ->
-    % Process message to get topic info and payload to forward
-    {topic, TopicName, Filterable, MsgSize, MsgToForward} = MsgProcessor(Message),
-
-    % Get or create topic record
-    Topic = case maps:find(TopicName, Topics) of
-        error ->
-            #topic{filterable = Filterable};
-        {ok, ExistingTopic} ->
-            ExistingTopic#topic{filterable = Filterable}
-    end,
-
-    % First update dispatch metrics (always counts all messages)
-    {_, _DispatchBandwidth, _DispatchRate, UpdatedTopic} =
-        update_dispatch_metrics(Topic, MsgSize),
-
-    % Update topics map with dispatch metrics
-    NewTopics = Topics#{TopicName => UpdatedTopic},
-    NewData = Data#data{topics = NewTopics},
-
-    % Get forwarding action and update forward metrics
-    % For non-filterable topics, update_forward_metrics uses infinity as limit
-    % and will always return 'forward' as the action
-    {Action, _ForwardBandwidth, _ForwardRate, FinalTopic} =
-        update_forward_metrics(UpdatedTopic, MsgSize),
-
-    % Update topics with forward metrics
-    FinalTopics = NewTopics#{TopicName => FinalTopic},
-    FinalData = NewData#data{topics = FinalTopics},
-
-    % Check if we should forward based on the action
-    case Action of
-        forward ->
-            % Forward the message to all hubs
-            forward_to_all_hubs(MsgToForward, FinalData),
-            {keep_state, FinalData};
-        drop ->
-            ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p",
-                       [TopicName, MsgSize]),
-            {keep_state, FinalData}
-    end;
+          Data = #data{}) ->
+    handle_dispatch(Message, Data);
 connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
     % Handle message from hub by dispatching it to the local callback
     dispatch_locally(Timestamp, Message, Data),
@@ -371,6 +345,23 @@ handle_common({call, From}, {attach, HubPid}, StateName, Data) ->
                 _ -> {keep_state, NewData, [{reply, From, ok}]}
             end
     end;
+handle_common(cast, {hub_add_peer, PeerNode, Opts}, _StateName,
+              Data = #data{peers = Peers}) ->
+    case ro2erl_bridge_cluster:ensure_peer(PeerNode, Opts) of
+        ok ->
+            ?LOG_INFO("Added peer ~p (opts=~p)", [PeerNode, Opts]),
+            {keep_state, Data#data{peers = Peers#{PeerNode => Opts}}};
+        {error, Reason} ->
+            ?LOG_WARNING("Failed to add peer ~p: ~p", [PeerNode, Reason]),
+            {keep_state_and_data, Data}
+    end;
+handle_common(cast, {hub_del_peer, PeerNode}, _StateName,
+              Data = #data{peers = Peers}) ->
+    ?LOG_INFO("Removed peer ~p", [PeerNode]),
+    {keep_state, Data#data{peers = maps:remove(PeerNode, Peers)}};
+handle_common(cast, {peer_dispatch, _OriginBridgeId, Timestamp, Message}, _StateName, Data) ->
+    dispatch_locally(Timestamp, Message, Data),
+    keep_state_and_data;
 handle_common({call, From}, get_metrics, _StateName, Data = #data{topics = Topics}) ->
     % Get metrics for each topic and build result map
     {Result, NewTopics} = maps:fold(fun(Name, Topic, {AccMetrics, AccTopics}) ->
@@ -447,6 +438,20 @@ generate_bridge_id() ->
     <<NodeBin/binary, "/",(base64:encode(Random))/binary>>.
 
 -doc """
+Get direct-connect flag from application environment.
+""".
+get_direct_connect() ->
+    case application:get_env(ro2erl_bridge, direct_connect) of
+        {ok, Bool} when is_boolean(Bool) -> Bool;
+        _ -> false
+    end.
+
+maybe_monitor_nodes(true) ->
+    net_kernel:monitor_nodes(true, []);
+maybe_monitor_nodes(false) ->
+    ok.
+
+-doc """
 Attach this bridge to a hub.
 
 Sets up monitoring, updates the hub map, and communicates with the hub.
@@ -466,7 +471,11 @@ attach_to_hub(HubPid, Data = #data{hubs = Hubs, bridge_id = BridgeId, hub_mod = 
             NewData = Data#data{hubs = NewHubs},
 
             % Use hub module's attach function to register with the hub
-            HubMod:attach(HubPid, BridgeId, self()),
+            AttachOpts = #{
+                direct_connect => Data#data.direct_connect,
+                node => node()
+            },
+            HubMod:attach(HubPid, BridgeId, self(), AttachOpts),
 
             ?LOG_NOTICE("Attached to hub ~p", [HubPid]),
             {ok, NewData}
@@ -515,6 +524,66 @@ forward_to_hub(HubPid, Message, #data{hub_mod = HubMod}) ->
     % Send to hub using the configured hub module
     HubMod:dispatch(HubPid, self(), Timestamp, Message),
     ?LOG_DEBUG("Forwarded message to hub ~p: ~p", [HubPid, Message]).
+
+-doc """
+Forward message to all configured peers (direct-connect mode).
+""".
+forward_to_all_peers(Message, #data{peers = Peers, bridge_id = BridgeId}) ->
+    Timestamp = erlang:system_time(millisecond),
+    maps:foreach(fun(PeerNode, _Opts) ->
+        ro2erl_bridge_peer:dispatch(PeerNode, Timestamp, BridgeId, Message)
+    end, Peers).
+
+
+%=== INTERNAL FUNCTIONS ========================================================
+
+-doc """
+Handle dispatch logic shared by connected and direct-disconnected cases.
+""".
+handle_dispatch(Message,
+                Data = #data{topics = Topics, msg_processor = MsgProcessor}) ->
+    % Process message to get topic info and payload to forward
+    {topic, TopicName, Filterable, MsgSize, MsgToForward} = MsgProcessor(Message),
+
+    % Get or create topic record
+    Topic = case maps:find(TopicName, Topics) of
+        error ->
+            #topic{filterable = Filterable};
+        {ok, ExistingTopic} ->
+            ExistingTopic#topic{filterable = Filterable}
+    end,
+
+    % First update dispatch metrics (always counts all messages)
+    {_, _DispatchBandwidth, _DispatchRate, UpdatedTopic} =
+        update_dispatch_metrics(Topic, MsgSize),
+
+    % Update topics map with dispatch metrics
+    NewTopics = Topics#{TopicName => UpdatedTopic},
+    NewData = Data#data{topics = NewTopics},
+
+    % Get forwarding action and update forward metrics
+    % For non-filterable topics, update_forward_metrics uses infinity as limit
+    % and will always return 'forward' as the action
+    {Action, _ForwardBandwidth, _ForwardRate, FinalTopic} =
+        update_forward_metrics(UpdatedTopic, MsgSize),
+
+    % Update topics with forward metrics
+    FinalTopics = NewTopics#{TopicName => FinalTopic},
+    FinalData = NewData#data{topics = FinalTopics},
+
+    % Check if we should forward based on the action
+    case {Action, FinalData#data.direct_connect} of
+        {forward, true} ->
+            forward_to_all_peers(MsgToForward, FinalData),
+            {keep_state, FinalData};
+        {forward, false} ->
+            forward_to_all_hubs(MsgToForward, FinalData),
+            {keep_state, FinalData};
+        {drop, _} ->
+            ?LOG_DEBUG("Message dropped due to rate limiting: topic=~p, size=~p",
+                       [TopicName, MsgSize]),
+            {keep_state, FinalData}
+    end.
 
 -doc """
 Dispatch received message locally using configured callback.

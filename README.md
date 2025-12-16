@@ -49,6 +49,21 @@ Configure ro2erl_bridge in your application's sys.config:
 Where:
 - `dispatch_callback`: A function that will be called when a message is received from the hub. It can be specified as `{Module, Function}` or `{Module, Function, Args}`.
 
+### Direct-connect mode (optional)
+
+To send data directly bridge<->bridge (no hub proxying of the data plane) while still reporting metrics to the hub and receiving bandwidth control:
+
+```erlang
+{ro2erl_bridge, [
+    {dispatch_callback, {my_app, handle_message}},
+    {direct_connect, true}
+]}.
+```
+
+- Attach remains backward compatible: `{bridge_attach, BridgeId, BridgePid}` is equivalent to `{bridge_attach, BridgeId, BridgePid, #{}}`
+- In direct-connect mode, the hub manages peers via `{hub_add_peer, PeerNode, Opts}` / `{hub_del_peer, PeerNode}`
+- The bridge forwards data directly to peers and does not expect the hub to proxy data-plane traffic
+
 ## Development
 
 ### Start Without TLS Distribution
