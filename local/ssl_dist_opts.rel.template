@@ -11,5 +11,17 @@
         {secure_renegotiate, true}
         %,{log_level, debug}
         %,{log_alert, true}
+    ]},
+    {server, [
+        {cacertfile, \"$HUB_CA_CERT\"},
+        {certs_keys, [
+            #{
+                certfile =>  \"$ROOT/local.pem\",
+                keyfile => \"$ROOT/local.key\"
+            }
+        ]},
+        {verify, verify_peer}
+        %,{log_level, debug}
+        %,{log_alert, true}
     ]}
 ].
