@@ -216,6 +216,20 @@ The bridge implements a sophisticated metrics and filtering system:
   - Controls how frequently topic metrics and information are sent to hubs
   - Adjusting this affects both update frequency and hub load
 
+- **Direct Connect Mode:** Enable direct bridge-to-bridge communication
+  - Specified as `direct_connect` boolean value
+  - Default: `false`
+  - When enabled, bridges communicate directly with each other without hub proxying of data-plane traffic
+  - Hub still manages peer connections and bandwidth control
+  - Requires TLS certificate configuration (`ca_cert_file` and `cert_file`)
+  - Enables peer-to-peer message forwarding for improved performance
+
+- **TLS Certificate Files:** Required for direct-connect mode
+  - `ca_cert_file`: Path to the CA certificate file (PEM format)
+  - `cert_file`: Path to the bridge's certificate file (PEM format)
+  - Used to establish secure direct connections between bridges
+  - Certificate fingerprint is included in peer options sent to the hub
+
 ### Runtime Configuration
 - **Bandwidth Limits:** Can be set per topic at runtime
   - Locally via `set_topic_bandwidth(TopicName, Limit)` where Limit is bytes/second

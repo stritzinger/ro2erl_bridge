@@ -48,6 +48,8 @@ Configure ro2erl_bridge in your application's sys.config:
 
 Where:
 - `dispatch_callback`: A function that will be called when a message is received from the hub. It can be specified as `{Module, Function}` or `{Module, Function, Args}`.
+- `msg_processor`: (Optional) A function to extract topic information from messages. It can be specified as `{Module, Function}` or `{Module, Function, Args}`. Must return `{topic, TopicName, Filterable, MsgSize, Payload}`. If not specified, defaults to a processor that returns `{topic, <<"unknown">>, false, 0, Msg}`.
+- `topic_update_period`: (Optional) Interval in milliseconds for sending topic updates to connected hubs. Default: 1000 (1 second).
 
 ### Direct-connect mode (optional)
 
@@ -56,13 +58,24 @@ To send data directly bridge<->bridge (no hub proxying of the data plane) while 
 ```erlang
 {ro2erl_bridge, [
     {dispatch_callback, {my_app, handle_message}},
-    {direct_connect, true}
+    {msg_processor, {my_app, process_message}},
+    {direct_connect, true},
+    {ca_cert_file, "priv/certificates/device.CA.pem"},
+    {cert_file, "priv/certificates/generic-device-0001.pem"},
+    {topic_update_period, 1000}
 ]}.
 ```
 
+Where:
+- `direct_connect`: (Optional) When set to `true`, enables direct bridge-to-bridge communication without hub proxying of data-plane traffic. Default: `false`.
+- `ca_cert_file`: (Required when `direct_connect` is `true`) Path to the CA certificate file (PEM format).
+- `cert_file`: (Required when `direct_connect` is `true`) Path to the bridge's certificate file (PEM format).
+
+Notes:
 - Attach remains backward compatible: `{bridge_attach, BridgeId, BridgePid}` is equivalent to `{bridge_attach, BridgeId, BridgePid, #{}}`
 - In direct-connect mode, the hub manages peers via `{hub_add_peer, PeerNode, Opts}` / `{hub_del_peer, PeerNode}`
 - The bridge forwards data directly to peers and does not expect the hub to proxy data-plane traffic
+- Hub still manages peer connections and bandwidth control even in direct-connect mode
 
 ## Development
 
