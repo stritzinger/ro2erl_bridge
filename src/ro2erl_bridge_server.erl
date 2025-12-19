@@ -228,7 +228,6 @@ callback_mode() -> [state_functions].
 
 init([HubMod, MsgProcessor, DispatchCallback]) ->
     DirectConnect = get_direct_connect(),
-    maybe_monitor_nodes(DirectConnect),
 
     % Generate a unique bridge ID
     BridgeId = generate_bridge_id(),
@@ -353,7 +352,7 @@ handle_common(cast, {hub_add_peer, PeerNode, Opts}, _StateName,
             {keep_state, Data#data{peers = Peers#{PeerNode => Opts}}};
         {error, Reason} ->
             ?LOG_WARNING("Failed to add peer ~p: ~p", [PeerNode, Reason]),
-            {keep_state_and_data, Data}
+            keep_state_and_data
     end;
 handle_common(cast, {hub_del_peer, PeerNode}, _StateName,
               Data = #data{peers = Peers}) ->
@@ -446,11 +445,6 @@ get_direct_connect() ->
         _ -> false
     end.
 
-maybe_monitor_nodes(true) ->
-    net_kernel:monitor_nodes(true, []);
-maybe_monitor_nodes(false) ->
-    ok.
-
 -doc """
 Attach this bridge to a hub.
 
@@ -475,7 +469,15 @@ attach_to_hub(HubPid, Data = #data{hubs = Hubs, bridge_id = BridgeId, hub_mod = 
                 direct_connect => Data#data.direct_connect,
                 node => node()
             },
-            HubMod:attach(HubPid, BridgeId, self(), AttachOpts),
+
+            % If direct connect is enabled, add peer options
+            FinalAttachOpts = case Data#data.direct_connect of
+                true ->
+                    add_peer_opts(AttachOpts);
+                false ->
+                    AttachOpts
+            end,
+            HubMod:attach(HubPid, BridgeId, self(), FinalAttachOpts),
 
             ?LOG_NOTICE("Attached to hub ~p", [HubPid]),
             {ok, NewData}
@@ -841,3 +843,72 @@ cancel_hub_update(Data = #data{topic_update_timer = undefined}) ->
 cancel_hub_update(Data = #data{topic_update_timer = Timer}) ->
     erlang:cancel_timer(Timer),
     Data#data{topic_update_timer = undefined}.
+
+add_peer_opts(AttachOpts) ->
+    {ok, Hostname} = inet:gethostname(),
+    {ok, Address} = get_ip_of_first_valid_interfaces(),
+    Cookie = erlang:get_cookie(),
+    {ok, CAFileSpec} = application:get_env(ro2erl_bridge, ca_cert_file),
+    {ok, CertFileSpec} = application:get_env(ro2erl_bridge, cert_file),
+    CAFile = resolve_cert_path(CAFileSpec),
+    CertFile = resolve_cert_path(CertFileSpec),
+    {ok, Ca} = file:read_file(CAFile),
+    {ok, Cert} = file:read_file(CertFile),
+
+    [{'Certificate', CertDer, not_encrypted} | _Rest] = public_key:pem_decode(Cert),
+    CertFingerprint = crypto:hash(sha256, CertDer),
+
+    AttachOpts#{peer_opts => #{
+        hostname => list_to_binary(Hostname),
+        address => Address,
+        cookie => Cookie,
+        ca => Ca,
+        fingerprint => CertFingerprint
+    }}.
+
+-doc """
+Resolve certificate path specification to an absolute file path.
+
+Supports the following path specifications:
+- Absolute path as a string or binary
+- `{priv, AppName, RelPath}` - file in application's priv directory
+""".
+-spec resolve_cert_path(PathSpec :: string() | binary() |
+                        {priv, atom(), string() | binary()}) -> string().
+resolve_cert_path(AbsPath) when is_list(AbsPath) ->
+    AbsPath;
+resolve_cert_path(AbsPath) when is_binary(AbsPath) ->
+    unicode:characters_to_list(AbsPath);
+resolve_cert_path({priv, AppName, RelPath})
+  when is_atom(AppName), is_binary(RelPath) ->
+    resolve_cert_path({priv, AppName, unicode:characters_to_list(RelPath)});
+resolve_cert_path({priv, AppName, RelPath})
+  when is_atom(AppName), is_list(RelPath) ->
+    case code:priv_dir(AppName) of
+        {error, bad_name} -> error({bad_appname, AppName});
+        BasePath -> filename:join(BasePath, RelPath)
+    end.
+
+get_ip_of_first_valid_interfaces() ->
+    {ok, Interfaces} = inet:getifaddrs(),
+    [First | _] = [Opts || {_Name, [{flags, Flags} | Opts]} <- Interfaces,
+                  flags_are_ok(Flags), has_ipv4(Opts)],
+    get_ipv4_from_opts(First).
+
+has_ipv4(Opts) ->
+    get_ipv4_from_opts(Opts) =/= undefined.
+
+flags_are_ok(Flags) ->
+    lists:member(up, Flags) and
+        lists:member(running, Flags) and
+        not lists:member(loopback, Flags).
+
+get_ipv4_from_opts([]) ->
+    undefined;
+get_ipv4_from_opts([{addr, {_1, _2, _3, _4}} | _]) ->
+    {ok, {_1, _2, _3, _4}};
+get_ipv4_from_opts([_ | TL]) ->
+    case get_ipv4_from_opts(TL) of
+        {ok, _IP} = Result -> Result;
+        Other -> Other
+    end.
