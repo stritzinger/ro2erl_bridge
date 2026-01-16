@@ -855,15 +855,15 @@ add_peer_opts(AttachOpts) ->
     {ok, Ca} = file:read_file(CAFile),
     {ok, Cert} = file:read_file(CertFile),
 
-    [{'Certificate', CertDer, not_encrypted} | _Rest] = public_key:pem_decode(Cert),
-    CertFingerprint = crypto:hash(sha256, CertDer),
+    CAFingerprint = gen_fingerprint(Ca),
+    CertFingerprint = gen_fingerprint(Cert),
 
     AttachOpts#{peer_opts => #{
         hostname => list_to_binary(Hostname),
         address => Address,
         cookie => Cookie,
         ca => Ca,
-        fingerprint => CertFingerprint
+        fingerprint => CertFingerprint ++ CAFingerprint
     }}.
 
 -doc """
@@ -912,3 +912,8 @@ get_ipv4_from_opts([_ | TL]) ->
         {ok, _IP} = Result -> Result;
         Other -> Other
     end.
+
+gen_fingerprint(Cert) ->
+    Certs = public_key:pem_decode(Cert),
+    [crypto:hash(sha256, CertDer) ||
+     {'Certificate', CertDer, not_encrypted} <- Certs].
