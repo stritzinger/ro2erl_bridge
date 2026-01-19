@@ -297,7 +297,9 @@ connected(cast, {dispatch, Message},
     handle_dispatch(Message, Data);
 connected(cast, {hub_dispatch, Timestamp, Message}, Data) ->
     % Handle message from hub by dispatching it to the local callback
-    dispatch_locally(Timestamp, Message, Data),
+    ?LOG_DEBUG("Received message from hub (timestamp: ~p): ~p",
+               [Timestamp, Message]),
+    dispatch_locally(Message, Data),
     keep_state_and_data;
 connected(info, topic_update,
           Data = #data{hubs = Hubs, hub_mod = HubMod, topics = Topics}) ->
@@ -359,7 +361,9 @@ handle_common(cast, {hub_del_peer, PeerNode}, _StateName,
     ?LOG_INFO("Removed peer ~p", [PeerNode]),
     {keep_state, Data#data{peers = maps:remove(PeerNode, Peers)}};
 handle_common(cast, {peer_dispatch, _OriginBridgeId, Timestamp, Message}, _StateName, Data) ->
-    dispatch_locally(Timestamp, Message, Data),
+    ?LOG_DEBUG("Received message from peer (timestamp: ~p): ~p",
+               [Timestamp, Message]),
+    dispatch_locally(Message, Data),
     keep_state_and_data;
 handle_common({call, From}, get_metrics, _StateName, Data = #data{topics = Topics}) ->
     % Get metrics for each topic and build result map
@@ -590,8 +594,7 @@ handle_dispatch(Message,
 -doc """
 Dispatch received message locally using configured callback.
 """.
-dispatch_locally(Timestamp, Message, #data{local_callback = Callback}) ->
-    ?LOG_DEBUG("Received message from hub (timestamp: ~p): ~p", [Timestamp, Message]),
+dispatch_locally(Message, #data{local_callback = Callback}) ->
     case Callback of
         undefined -> ok;
         CallbackFun when is_function(CallbackFun, 1) ->
@@ -863,7 +866,8 @@ add_peer_opts(AttachOpts) ->
         address => Address,
         cookie => Cookie,
         ca => Ca,
-        fingerprint => CertFingerprint ++ CAFingerprint
+        fingerprint => CertFingerprint ++ CAFingerprint,
+        monitor => true
     }}.
 
 -doc """
