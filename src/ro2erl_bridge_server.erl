@@ -849,7 +849,12 @@ cancel_hub_update(Data = #data{topic_update_timer = Timer}) ->
 
 add_peer_opts(AttachOpts) ->
     {ok, Hostname} = inet:gethostname(),
-    {ok, Address} = get_ip_of_first_valid_interfaces(),
+    Address = case application:get_env(ro2erl_bridge, ip, undefined) of
+        undefined ->
+            {ok, IP} = get_ip_of_first_valid_interfaces(),
+            IP;
+        IP -> IP
+    end,
     Cookie = erlang:get_cookie(),
     {ok, CAFileSpec} = application:get_env(ro2erl_bridge, ca_cert_file),
     {ok, CertFileSpec} = application:get_env(ro2erl_bridge, cert_file),
